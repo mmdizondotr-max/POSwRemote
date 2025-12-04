@@ -454,6 +454,7 @@ class POSSystem:
         self.inventory_cart = []
         self.correction_cart = []
         self.remote_requests = [] # List to store pending remote requests
+        self.lws_sidebars = {}
 
         # Web Server State
         self.web_queue = queue.Queue()
@@ -601,7 +602,8 @@ class POSSystem:
         for req in self.remote_requests:
             if req['mode'] == 'inventory':
                 time_str = req['timestamp'].strftime('%H:%M')
-                item_summary = f"{len(req['items'])} items"
+                total_items = sum(int(x.get('qty', 0)) for x in req['items'])
+                item_summary = f"{total_items} items"
                 self.inv_req_tree.insert("", "end", values=(time_str, req['ip'], item_summary), tags=(req['id'],))
 
         # Refresh POS Sidebar
@@ -609,8 +611,52 @@ class POSSystem:
         for req in self.remote_requests:
             if req['mode'] == 'sales':
                 time_str = req['timestamp'].strftime('%H:%M')
-                item_summary = f"{len(req['items'])} items"
+                total_amt = sum(float(x.get('price', 0)) * int(x.get('qty', 0)) for x in req['items'])
+                item_summary = f"{total_amt:.2f}"
                 self.pos_req_tree.insert("", "end", values=(time_str, req['ip'], item_summary), tags=(req['id'],))
+
+    def load_remote_request_to_cart(self, req):
+        mode = req['mode']
+        items = req['items']
+
+        processed_items = []
+        for i in items:
+            processed_items.append({
+                "code": "",
+                "name": i['name'],
+                "price": float(i['price']),
+                "qty": int(i['qty']),
+                "subtotal": float(i.get('price', 0)) * int(i.get('qty', 0)),
+                "category": i.get('category', 'General')
+            })
+
+        if mode == 'sales':
+            # Check stock warning
+            stats, _, _, _ = self.calculate_stats(None)
+            warnings = []
+            for i in processed_items:
+                hist = stats.get(i['name'], {'in': 0, 'out': 0})
+                avail = hist['in'] - hist['out']
+                if i['qty'] > avail:
+                    warnings.append(f"{i['name']} (Req: {i['qty']}, Avail: {int(avail)})")
+
+            if warnings:
+                msg = "Insufficient stock for:\n" + "\n".join(warnings) + "\n\nAdd to cart anyway?"
+                if not messagebox.askyesno("Stock Warning", msg):
+                    return
+
+            self.sales_cart = processed_items
+            self.refresh_pos()
+            self.on_pos_sel(None)
+            self.notebook.select(self.tab_pos)
+
+        elif mode == 'inventory':
+            self.inventory_cart = processed_items
+            self.refresh_inv()
+            self.notebook.select(self.tab_inventory)
+
+        self.remote_requests.remove(req)
+        self.refresh_remote_sidebars()
 
     def setup_web_server_panel(self, parent_frame):
         frame = ttk.Frame(parent_frame)
@@ -1093,11 +1139,11 @@ class POSSystem:
         # Apply Inventory Style (Orange)
         self.tab_inventory.config(style="Inventory.TFrame")
 
+        # LWS Sidebar (Setup first to ensure correct packing order when shown)
+        self.setup_lws_sidebar(self.tab_inventory, "inventory")
+
         main_content = ttk.Frame(self.tab_inventory, style="Inventory.TFrame")
         main_content.pack(side="left", fill="both", expand=True)
-
-        # LWS Sidebar
-        self.setup_lws_sidebar(self.tab_inventory, "inventory")
 
         f = ttk.LabelFrame(main_content, text="Stock In", style="Inventory.TLabelframe")
         f.pack(fill="x", padx=5, pady=5)
@@ -1195,11 +1241,11 @@ class POSSystem:
         # Sales Tab uses default Green Theme but we ensure it matches
         self.tab_pos.config(style="Sales.TFrame")
 
+        # LWS Sidebar (Setup first to ensure correct packing order when shown)
+        self.setup_lws_sidebar(self.tab_pos, "sales")
+
         main_content = ttk.Frame(self.tab_pos, style="Sales.TFrame")
         main_content.pack(side="left", fill="both", expand=True)
-
-        # LWS Sidebar
-        self.setup_lws_sidebar(self.tab_pos, "sales")
 
         f = ttk.LabelFrame(main_content, text="Sale")
         f.pack(fill="x", padx=5, pady=5)
@@ -1254,21 +1300,25 @@ class POSSystem:
 
     def setup_lws_sidebar(self, parent_frame, mode):
         # Create a frame for the sidebar
-        self.lws_sidebar_frame = ttk.Frame(parent_frame, width=250)
-        self.lws_sidebar_frame.pack(side="right", fill="y", padx=5, pady=5)
-        self.lws_sidebar_frame.pack_propagate(False) # Fixed width
+        sidebar_frame = ttk.Frame(parent_frame, width=250)
+        # Pack first to establish order, then hide
+        sidebar_frame.pack(side="right", fill="y", padx=5, pady=5)
+        sidebar_frame.pack_forget()
+        sidebar_frame.pack_propagate(False) # Fixed width
 
-        lbl_title = ttk.Label(self.lws_sidebar_frame, text="Remote Requests", font=("Segoe UI", 10, "bold"))
+        self.lws_sidebars[mode] = sidebar_frame
+
+        lbl_title = ttk.Label(sidebar_frame, text="Remote Requests", font=("Segoe UI", 10, "bold"))
         lbl_title.pack(pady=5)
 
-        tree_frame = ttk.Frame(self.lws_sidebar_frame)
+        tree_frame = ttk.Frame(sidebar_frame)
         tree_frame.pack(fill="both", expand=True)
 
         cols = ("time", "ip", "summary")
         tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
         tree.heading("time", text="Time")
         tree.heading("ip", text="IP")
-        tree.heading("summary", text="Items")
+        tree.heading("summary", text="Total")
         tree.column("time", width=50)
         tree.column("ip", width=80)
         tree.column("summary", width=80)
@@ -1279,23 +1329,26 @@ class POSSystem:
         else:
             self.pos_req_tree = tree
 
-        btn_frame = ttk.Frame(self.lws_sidebar_frame)
+        btn_frame = ttk.Frame(sidebar_frame)
         btn_frame.pack(pady=10)
 
-        # Approve Button (Check)
-        ttk.Button(btn_frame, text="✔", width=4,
-                   command=lambda: self.action_remote_request(mode, "approve")).pack(side="left", padx=5)
+        # Add to Cart Button (Replaces Check)
+        ttk.Button(btn_frame, text="Add to Cart", width=12,
+                   command=lambda: self.action_remote_request(mode, "add_to_cart")).pack(side="left", padx=5)
 
         # Reject Button (Cross)
         ttk.Button(btn_frame, text="✖", width=4,
                    command=lambda: self.action_remote_request(mode, "reject")).pack(side="left", padx=5)
 
     def show_remote_sidebars(self):
-        # Already set up in setup_ui, but maybe we want to hide them if LWS is not running?
-        # The requirement says "When the LWS is active... will have a Local Web Server Sidebar".
-        # For simplicity, we can just leave them visible but empty, or pack/unpack.
-        # Given the layout, packing/unpacking might be complex. Let's leave them visible.
-        pass
+        for mode, frame in self.lws_sidebars.items():
+            # Packing again with correct options should restore it in correct slot
+            # because we packed it first in setup logic.
+            frame.pack(side="right", fill="y", padx=5, pady=5)
+
+    def hide_remote_sidebars(self):
+        for mode, frame in self.lws_sidebars.items():
+            frame.pack_forget()
 
     def action_remote_request(self, mode, action):
         tree = self.inv_req_tree if mode == 'inventory' else self.pos_req_tree
@@ -1312,78 +1365,8 @@ class POSSystem:
             if messagebox.askyesno("Reject", "Reject this request?"):
                 self.remote_requests.remove(req)
                 self.refresh_remote_sidebars()
-        elif action == "approve":
-            # Process Request
-            self.process_approved_request(req)
-            self.remote_requests.remove(req)
-            self.refresh_remote_sidebars()
-
-    def process_approved_request(self, req):
-        mode = req['mode']
-        items = req['items']
-        ip = req['ip']
-        timestamp = req['timestamp']
-        date_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
-
-        processed_items = []
-        for i in items:
-            processed_items.append({
-                "code": "",
-                "name": i['name'],
-                "price": float(i['price']),
-                "qty": int(i['qty']),
-                "subtotal": float(i.get('subtotal', 0)),
-                "category": i.get('category', 'General'),
-                "new_stock": 0
-            })
-
-        if mode == 'sales':
-            # Check stock again just in case
-            stats, _, _, _ = self.calculate_stats(None)
-            for i in processed_items:
-                hist = stats.get(i['name'], {'in': 0, 'out': 0})
-                avail = hist['in'] - hist['out']
-                if i['qty'] > avail:
-                    messagebox.showerror("Stock Error", f"Insufficient stock for {i['name']}. Cannot approve.")
-                    return
-
-            fname = f"REMOTE_{timestamp.strftime('%Y%m%d-%H%M%S')}.pdf"
-            if self.generate_grouped_pdf(os.path.join(RECEIPT_FOLDER, fname), "SALES RECEIPT (REMOTE)", date_str,
-                                         processed_items,
-                                         ["Item", "Price", "Qty", "Total"], [1.0, 4.5, 5.5, 6.5],
-                                         subtotal_indices=[2, 3], extra_info=f"Source: Mobile ({ip})"):
-                transaction = {"type": "sales", "timestamp": date_str, "filename": fname, "items": processed_items,
-                               "source": f"remote_{ip}"}
-                self.ledger.append(transaction)
-                self.save_ledger()
-                messagebox.showinfo("Approved", f"Remote Sale Approved and Processed!")
-
-        elif mode == 'inventory':
-            stats, _, _, _ = self.calculate_stats(None)
-            final_items = []
-            for i in processed_items:
-                hist = stats.get(i['name'], {'in': 0, 'out': 0})
-                new_stock = (hist['in'] + i['qty']) - hist['out']
-                i['new_stock'] = new_stock
-                final_items.append(i)
-
-            fname = f"Inv_REMOTE_{timestamp.strftime('%Y%m%d-%H%M%S')}.pdf"
-            if self.generate_grouped_pdf(os.path.join(INVENTORY_FOLDER, fname), "INVENTORY RECEIPT (REMOTE)",
-                                         date_str, final_items, ["Item", "Price", "Qty Added", "New Stock"],
-                                         [1.0, 4.5, 5.5, 6.5], subtotal_indices=[2], is_inventory=True,
-                                         extra_info=f"Source: Mobile ({ip})"):
-                transaction = {"type": "inventory", "timestamp": date_str, "filename": fname, "items": final_items,
-                               "source": f"remote_{ip}"}
-                self.ledger.append(transaction)
-                self.save_ledger()
-                messagebox.showinfo("Approved", f"Remote Stock In Approved and Processed!")
-
-        self.refresh_stock_cache()
-        current_tab = self.notebook.tab(self.notebook.select(), "text")
-        if current_tab == 'SUMMARY':
-            self.gen_view()
-        elif current_tab == 'POS (SALES)':
-            self.on_pos_sel(None)
+        elif action == "add_to_cart":
+            self.load_remote_request_to_cart(req)
 
     def on_pos_sel(self, e):
         sel = self.pos_prod_var.get()
