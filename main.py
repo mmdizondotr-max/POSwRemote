@@ -428,6 +428,10 @@ class POSSystem:
         self.root.title(APP_TITLE)
         self.root.geometry("1100x750")
         self.root.minsize(800, 500)
+        try:
+            self.root.state('zoomed')
+        except:
+            self.root.attributes('-zoomed', True)
 
         # Session Info
         login_time = datetime.datetime.now().strftime("%H%M%S")
@@ -438,7 +442,7 @@ class POSSystem:
         if splash: splash.update_status("Loading Config & Ledger...")
         self.config = self.load_config()
         self.touch_mode = self.config.get("touch_mode", False)
-        self.ledger, self.summary_count = self.load_ledger()
+        self.ledger, self.summary_count, self.shortcuts_asked = self.load_ledger()
 
         if splash: splash.update_status("Loading Products...")
         self.products_df = pd.DataFrame()
@@ -471,6 +475,7 @@ class POSSystem:
 
         # Scheduled Tasks
         self.root.after(1000, self.check_beginning_inventory_reminder)
+        self.root.after(2000, self.check_shortcuts)
         self.root.after(100, self.process_web_queue)
 
     def setup_ui(self):
@@ -739,20 +744,61 @@ class POSSystem:
                 with open(LEDGER_FILE, 'r') as f:
                     data = json.load(f)
                     if isinstance(data, list):
-                        return data, 0
+                        return data, 0, False
                     elif isinstance(data, dict):
-                        return data.get("transactions", []), data.get("summary_count", 0)
+                        return data.get("transactions", []), data.get("summary_count", 0), data.get("shortcuts_asked", False)
             except:
-                return [], 0
-        return [], 0
+                return [], 0, False
+        return [], 0, False
 
     def save_ledger(self):
         try:
-            data = {"transactions": self.ledger, "summary_count": self.summary_count}
+            data = {"transactions": self.ledger, "summary_count": self.summary_count, "shortcuts_asked": self.shortcuts_asked}
             with open(LEDGER_FILE, 'w') as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
             messagebox.showerror("Save Error", f"Could not save database: {e}")
+
+    def check_shortcuts(self):
+        if not self.shortcuts_asked:
+            if messagebox.askyesno("Desktop Shortcuts", "Create shortcuts for App and Summary Folder on Desktop?"):
+                self.create_shortcuts()
+            self.shortcuts_asked = True
+            self.save_ledger()
+
+    def create_shortcuts(self):
+        try:
+            desktop = os.path.normpath(os.path.join(os.environ['USERPROFILE'], 'Desktop'))
+
+            # 1. App Shortcut
+            exe_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
+            link_name = f"{APP_TITLE}.lnk"
+            self.create_shortcut_vbs(exe_path, os.path.join(desktop, link_name))
+
+            # 2. Summary Folder Shortcut
+            folder_path = os.path.abspath(SUMMARY_FOLDER)
+            folder_link_name = "Summary Receipts.lnk"
+            self.create_shortcut_vbs(folder_path, os.path.join(desktop, folder_link_name))
+
+            messagebox.showinfo("Shortcuts", "Shortcuts created on Desktop.")
+        except Exception as e:
+            messagebox.showerror("Shortcut Error", f"Could not create shortcuts: {e}")
+
+    def create_shortcut_vbs(self, target, link_path):
+        vbs_content = f"""
+            Set oWS = WScript.CreateObject("WScript.Shell")
+            Set oLink = oWS.CreateShortcut("{link_path}")
+            oLink.TargetPath = "{target}"
+            oLink.Save
+        """
+        vbs_path = os.path.join(os.environ["TEMP"], "create_shortcut.vbs")
+        with open(vbs_path, "w") as f:
+            f.write(vbs_content)
+        os.system(f'cscript //Nologo "{vbs_path}"')
+        try:
+            os.remove(vbs_path)
+        except:
+            pass
 
     def get_time(self):
         return datetime.datetime.now()
@@ -1852,7 +1898,7 @@ class POSSystem:
             try:
                 products_data = self.products_df.to_dict('records') if not self.products_df.empty else []
                 data = {"transactions": self.ledger, "summary_count": self.summary_count,
-                        "products_master": products_data}
+                        "products_master": products_data, "shortcuts_asked": self.shortcuts_asked}
                 with open(save_path, 'w') as f:
                     json.dump(data, f, indent=2)
                 messagebox.showinfo("Backup", "Done.")
@@ -1868,12 +1914,14 @@ class POSSystem:
                 backup_data = json.load(f)
             new_ledger = [];
             new_count = 0
+            new_shortcuts_asked = False
             if isinstance(backup_data, list):
                 new_ledger = backup_data;
                 new_count = 0
             elif isinstance(backup_data, dict):
                 new_ledger = backup_data.get("transactions", [])
                 new_count = backup_data.get("summary_count", 0)
+                new_shortcuts_asked = backup_data.get("shortcuts_asked", False)
 
             restored_prod_msg = ""
             products_master = backup_data.get("products_master", []) if isinstance(backup_data, dict) else []
@@ -1895,6 +1943,7 @@ class POSSystem:
             count = 0
             self.ledger = new_ledger
             self.summary_count = new_count
+            self.shortcuts_asked = new_shortcuts_asked
             self.save_ledger()
             for entry in self.ledger:
                 fname = entry.get('filename');
