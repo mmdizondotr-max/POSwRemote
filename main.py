@@ -15,6 +15,8 @@ import re  # Restore import re
 from PIL import Image, ImageTk
 from style_manager import StyleManager
 
+# pyinstaller --onefile --noconsole --splash splash_image.png main.py
+
 # --- CONFIGURATION ---
 RECEIPT_FOLDER = "receipts"
 INVENTORY_FOLDER = "inventoryreceipts"
