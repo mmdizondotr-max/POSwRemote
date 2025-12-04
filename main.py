@@ -23,7 +23,7 @@ CORRECTION_FOLDER = "correctionreceipts"
 DATA_FILE = "products.xlsx"
 CONFIG_FILE = "config.json"
 LEDGER_FILE = "ledger.json"
-APP_TITLE = "MMD Portable PoS v12.1"  # Version Bump
+APP_TITLE = "MMD Portable PoS v12.2"  # Version Bump
 
 # --- EMAIL SENDER CONFIGURATION ---
 SMTP_SERVER = "smtp.gmail.com"
