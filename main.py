@@ -19,6 +19,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email import encoders
 from PIL import Image, ImageTk
+from style_manager import StyleManager
 
 # --- NEW IMPORTS FOR WEB SERVER ---
 try:
@@ -439,6 +440,7 @@ class POSSystem:
         # Data & Config
         if splash: splash.update_status("Loading Config & Ledger...")
         self.config = self.load_config()
+        self.touch_mode = self.config.get("touch_mode", False)
         self.ledger, self.summary_count = self.load_ledger()
 
         if splash: splash.update_status("Loading Products...")
@@ -475,34 +477,25 @@ class POSSystem:
         self.root.after(100, self.process_web_queue)
 
     def setup_ui(self):
-        style = ttk.Style()
-        style.theme_use('clam')
-        default_font = ("Segoe UI", 10)
-        bold_font = ("Segoe UI", 10, "bold")
-        style.configure(".", font=default_font)
-        style.configure("Treeview.Heading", font=bold_font)
-        style.configure("TNotebook.Tab", padding=[10, 8], font=bold_font)
+        self.style_manager = StyleManager(self.root, self.touch_mode)
 
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(expand=True, fill='both', padx=2, pady=2)
 
         self.tab_inventory = ttk.Frame(self.notebook)
         self.tab_pos = ttk.Frame(self.notebook)
-        self.tab_web = ttk.Frame(self.notebook)
         self.tab_correction = ttk.Frame(self.notebook)
         self.tab_summary = ttk.Frame(self.notebook)
         self.tab_settings = ttk.Frame(self.notebook)
 
         self.notebook.add(self.tab_inventory, text='INVENTORY')
         self.notebook.add(self.tab_pos, text='POS (SALES)')
-        self.notebook.add(self.tab_web, text='WEB SERVER')
         self.notebook.add(self.tab_correction, text='CORRECTION')
         self.notebook.add(self.tab_summary, text='SUMMARY')
         self.notebook.add(self.tab_settings, text='SETTINGS')
 
         self.setup_inventory_tab()
         self.setup_pos_tab()
-        self.setup_web_tab()
         self.setup_correction_tab()
         self.setup_summary_tab()
         self.setup_settings_tab()
@@ -623,8 +616,8 @@ class POSSystem:
         elif current_tab == 'POS (SALES)':
             self.on_pos_sel(None)
 
-    def setup_web_tab(self):
-        frame = ttk.Frame(self.tab_web)
+    def setup_web_server_panel(self, parent_frame):
+        frame = ttk.Frame(parent_frame)
         frame.pack(fill="both", expand=True, padx=20, pady=20)
 
         left_panel = ttk.LabelFrame(frame, text="Connection Info")
@@ -1100,32 +1093,45 @@ class POSSystem:
             return False
 
     def setup_inventory_tab(self):
-        f = ttk.LabelFrame(self.tab_inventory, text="Stock In")
+        # Apply Inventory Style (Orange)
+        self.tab_inventory.config(style="Inventory.TFrame")
+
+        f = ttk.LabelFrame(self.tab_inventory, text="Stock In", style="Inventory.TLabelframe")
         f.pack(fill="x", padx=5, pady=5)
-        top_bar = ttk.Frame(f)
+
+        top_bar = ttk.Frame(f, style="Inventory.TFrame")
         top_bar.pack(fill="x", padx=5, pady=5)
+
         self.inv_prod_var = tk.StringVar()
         self.inv_dropdown = ttk.Combobox(top_bar, textvariable=self.inv_prod_var, width=45)
         self.inv_dropdown['values'] = self.get_dropdown_values()
         self.inv_dropdown.pack(side="left", padx=5)
-        ttk.Label(top_bar, text="Qty:").pack(side="left")
+
+        ttk.Label(top_bar, text="Qty:", style="Inventory.TLabel").pack(side="left")
         self.inv_qty_var = tk.IntVar(value=1)
         ttk.Entry(top_bar, textvariable=self.inv_qty_var, width=5).pack(side="left", padx=5)
+
         ttk.Button(top_bar, text="Add", command=self.add_inv).pack(side="left", padx=10)
-        tree_frame = ttk.Frame(self.tab_inventory)
+
+        tree_frame = ttk.Frame(self.tab_inventory, style="Inventory.TFrame")
         tree_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
         scrollbar = ttk.Scrollbar(tree_frame)
         scrollbar.pack(side="right", fill="y")
+
         self.inv_tree = ttk.Treeview(tree_frame, columns=("cat", "name", "price", "qty"), show="headings",
                                      yscrollcommand=scrollbar.set)
         scrollbar.config(command=self.inv_tree.yview)
+
         self.inv_tree.heading("cat", text="Category")
         self.inv_tree.heading("name", text="Product")
         self.inv_tree.heading("price", text="Price")
         self.inv_tree.heading("qty", text="Qty")
         self.inv_tree.pack(fill="both", expand=True)
-        b = ttk.Frame(self.tab_inventory)
+
+        b = ttk.Frame(self.tab_inventory, style="Inventory.TFrame")
         b.pack(fill="x", padx=5, pady=10)
+
         ttk.Button(b, text="COMMIT STOCK", command=self.commit_inv, style="Accent.TButton").pack(side="right", ipadx=10)
         ttk.Button(b, text="Clear", command=self.clear_inv).pack(side="right", padx=5)
         ttk.Button(b, text="Del Line", command=self.del_inv_line).pack(side="right", padx=5)
@@ -1183,28 +1189,39 @@ class POSSystem:
             messagebox.showinfo("Success", f"Stock Added. Receipt: {fname}")
 
     def setup_pos_tab(self):
+        # Sales Tab uses default Green Theme but we ensure it matches
+        self.tab_pos.config(style="Sales.TFrame")
+
         f = ttk.LabelFrame(self.tab_pos, text="Sale")
         f.pack(fill="x", padx=5, pady=5)
+
         input_row = ttk.Frame(f)
         input_row.pack(fill="x", padx=5, pady=5)
+
         self.pos_prod_var = tk.StringVar()
         self.pos_dropdown = ttk.Combobox(input_row, textvariable=self.pos_prod_var, width=45)
         self.pos_dropdown['values'] = self.get_dropdown_values()
         self.pos_dropdown.pack(side="left", padx=5)
         self.pos_dropdown.bind("<<ComboboxSelected>>", self.on_pos_sel)
+
         ttk.Label(input_row, text="Qty:").pack(side="left")
         self.pos_qty_var = tk.IntVar(value=1)
         ttk.Entry(input_row, textvariable=self.pos_qty_var, width=5).pack(side="left", padx=2)
+
         ttk.Button(input_row, text="ADD", command=self.add_pos).pack(side="left", padx=10)
         self.lbl_stock_avail = ttk.Label(input_row, text="", foreground="blue", font=("Segoe UI", 9, "bold"))
         self.lbl_stock_avail.pack(side="left", padx=10)
+
         tree_frame = ttk.Frame(self.tab_pos)
         tree_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
         scrollbar = ttk.Scrollbar(tree_frame)
         scrollbar.pack(side="right", fill="y")
+
         self.pos_tree = ttk.Treeview(tree_frame, columns=("cat", "name", "price", "qty", "sub"),
                                      show="headings", yscrollcommand=scrollbar.set)
         scrollbar.config(command=self.pos_tree.yview)
+
         self.pos_tree.heading("cat", text="Cat");
         self.pos_tree.heading("name", text="Product")
         self.pos_tree.heading("price", text="Price");
@@ -1215,10 +1232,13 @@ class POSSystem:
         self.pos_tree.column("qty", width=40);
         self.pos_tree.column("sub", width=70)
         self.pos_tree.pack(fill="both", expand=True)
+
         b = ttk.Frame(self.tab_pos)
         b.pack(fill="x", padx=5, pady=10)
+
         self.lbl_pos_total = ttk.Label(b, text="Total: 0.00", font=("Segoe UI", 14, "bold"), foreground="#d32f2f")
         self.lbl_pos_total.pack(side="left", padx=5)
+
         ttk.Button(b, text="CHECKOUT", command=self.checkout, style="Accent.TButton").pack(side="right", ipadx=20)
         ttk.Button(b, text="Clear", command=self.clear_pos).pack(side="right", padx=5)
         ttk.Button(b, text="Del", command=self.del_pos_line).pack(side="right", padx=5)
@@ -1584,11 +1604,29 @@ class POSSystem:
                 messagebox.showinfo("History Generated", f"Historical PDF Generated (No Email/Counter).\nFile: {fname}")
 
     def setup_settings_tab(self):
-        f = ttk.LabelFrame(self.tab_settings, text="Settings")
+        # Create nested notebook
+        self.settings_notebook = ttk.Notebook(self.tab_settings)
+        self.settings_notebook.pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.tab_settings_general = ttk.Frame(self.settings_notebook)
+        self.tab_settings_web = ttk.Frame(self.settings_notebook)
+
+        self.settings_notebook.add(self.tab_settings_general, text="General")
+        self.settings_notebook.add(self.tab_settings_web, text="Web Server")
+
+        # --- General Settings ---
+        f = ttk.LabelFrame(self.tab_settings_general, text="Settings")
         f.pack(fill="both", expand=True, padx=10, pady=10)
+
         self.chk_startup_var = tk.BooleanVar(value=self.config.get("startup", False))
         ttk.Checkbutton(f, text="Launch at Startup", variable=self.chk_startup_var, command=self.toggle_startup).pack(
             pady=5, anchor="w")
+
+        # Touch Mode Toggle
+        self.chk_touch_var = tk.BooleanVar(value=self.touch_mode)
+        ttk.Checkbutton(f, text="Enable Touch Mode (Larger UI)", variable=self.chk_touch_var, command=self.toggle_touch_mode).pack(
+            pady=5, anchor="w")
+
         ttk.Separator(f, orient='horizontal').pack(fill='x', pady=10)
         ttk.Label(f, text="Email Receipt Sync", font=("Segoe UI", 10, "bold")).pack(anchor="w")
         email_frame = ttk.Frame(f)
@@ -1617,6 +1655,9 @@ class POSSystem:
         ttk.Separator(f, orient='horizontal').pack(fill='x', pady=10)
         ttk.Button(f, text="Load Test (Dev)", command=self.run_load_test, style="Danger.TButton").pack(anchor="w",
                                                                                                        pady=5)
+
+        # --- Web Server Settings ---
+        self.setup_web_server_panel(self.tab_settings_web)
 
     def verify_and_test_email(self):
         email_input = self.entry_email.get().strip()
@@ -1651,6 +1692,13 @@ class POSSystem:
         self.config["splash_img"] = self.entry_img.get()
         self.save_config();
         messagebox.showinfo("Success", "Saved.")
+
+    def toggle_touch_mode(self):
+        enabled = self.chk_touch_var.get()
+        self.touch_mode = enabled
+        self.config["touch_mode"] = enabled
+        self.save_config()
+        self.style_manager.set_touch_mode(enabled)
 
     def toggle_startup(self):
         startup_folder = os.path.join(os.getenv("APPDATA"), r"Microsoft\Windows\Start Menu\Programs\Startup")
