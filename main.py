@@ -8,26 +8,12 @@ import shutil
 import threading
 import time
 import random
-import smtplib
-import ssl
-import re
 import socket
 import queue
 import secrets
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email import encoders
+import re  # Restore import re
 from PIL import Image, ImageTk
 from style_manager import StyleManager
-
-# --- NEW IMPORTS FOR WEB SERVER ---
-try:
-    from flask import Flask, request, jsonify, render_template_string
-    import qrcode
-except ImportError:
-    messagebox.showerror("Missing Libraries", "Please install required libraries:\npip install flask qrcode")
-    sys.exit()
 
 # --- CONFIGURATION ---
 RECEIPT_FOLDER = "receipts"
@@ -50,6 +36,17 @@ pd = None
 canvas = None
 letter = None
 inch = None
+Flask = None
+request = None
+jsonify = None
+render_template_string = None
+qrcode = None
+smtplib = None
+ssl = None
+MIMEText = None
+MIMEMultipart = None
+MIMEBase = None
+encoders = None
 
 # Ensure folders exist
 for folder in [RECEIPT_FOLDER, INVENTORY_FOLDER, SUMMARY_FOLDER, CORRECTION_FOLDER]:
@@ -123,7 +120,7 @@ MOBILE_HTML_TEMPLATE = """
             <div id="cart-list"></div>
             <hr>
             <div style="text-align: right; font-weight: bold; font-size: 1.2em;">Total: <span id="total-amt">0.00</span></div>
-            <button class="btn-success" onclick="submitTransaction()">CONFIRM TRANSACTION</button>
+            <button class="btn-success" onclick="submitTransaction()">REQUEST</button>
             <button class="btn-danger" style="margin-top:5px; background: #666;" onclick="clearCart()">CLEAR</button>
         </div>
     </div>
@@ -271,7 +268,7 @@ MOBILE_HTML_TEMPLATE = """
                 }
             }
 
-            if(!confirm("Submit this transaction to PC?")) return;
+            if(!confirm("Submit this request to PC?")) return;
 
             // Submit with Token in URL
             fetch('/submit_transaction?token=' + AUTH_TOKEN, {
@@ -285,7 +282,7 @@ MOBILE_HTML_TEMPLATE = """
             })
             .then(res => {
                 if(res.status === 'success') {
-                    alert("Success! Receipt generated on PC.");
+                    alert("Success! Request sent to PC.");
                     cart = [];
                     renderCart();
                     // Refresh product list to get new stock levels
@@ -456,6 +453,7 @@ class POSSystem:
         self.sales_cart = []
         self.inventory_cart = []
         self.correction_cart = []
+        self.remote_requests = [] # List to store pending remote requests
 
         # Web Server State
         self.web_queue = queue.Queue()
@@ -463,10 +461,8 @@ class POSSystem:
         self.web_port = self.find_free_port()
         self.connected_devices = {}
         self.session_token = secrets.token_hex(4)
-
-        # Start Web Server
-        if splash: splash.update_status("Starting Local Web Server...")
-        self.start_web_server()
+        self.web_thread = None
+        self.web_server_running = False
 
         # UI Setup
         self.setup_ui()
@@ -523,6 +519,8 @@ class POSSystem:
         return 5000
 
     def start_web_server(self):
+        if self.web_server_running: return
+
         def get_context():
             # Injecting self.current_stock_cache so Web Thread can see real levels
             return {
@@ -536,9 +534,13 @@ class POSSystem:
 
         self.web_thread = WebServerThread(self.web_queue, self.web_port, get_context, get_token)
         self.web_thread.start()
+        self.web_server_running = True
+        self.show_remote_sidebars()
 
     def rotate_token(self):
         self.session_token = secrets.token_hex(4)
+        if not self.web_server_running:
+            self.start_web_server()
         self.generate_qr()
         self.refresh_connected_devices_table()
 
@@ -563,58 +565,52 @@ class POSSystem:
 
         if not items: return
         now = self.get_time()
-        date_str = now.strftime('%Y-%m-%d %H:%M:%S')
 
-        processed_items = []
-        for i in items:
-            processed_items.append({
-                "code": "",
-                "name": i['name'],
-                "price": float(i['price']),
-                "qty": int(i['qty']),
-                "subtotal": float(i.get('subtotal', 0)),
-                "category": i.get('category', 'General'),
-                "new_stock": 0
-            })
+        # Add to remote requests list
+        request_id = secrets.token_hex(4)
+        request_data = {
+            "id": request_id,
+            "ip": ip,
+            "mode": mode,
+            "timestamp": now,
+            "items": items
+        }
 
+        # Stock Check Logic for Sales is already done in Web Server Thread, but double check
         if mode == 'sales':
-            fname = f"REMOTE_{now.strftime('%Y%m%d-%H%M%S')}.pdf"
-            if self.generate_grouped_pdf(os.path.join(RECEIPT_FOLDER, fname), "SALES RECEIPT (REMOTE)", date_str,
-                                         processed_items,
-                                         ["Item", "Price", "Qty", "Total"], [1.0, 4.5, 5.5, 6.5],
-                                         subtotal_indices=[2, 3], extra_info=f"Source: Mobile ({ip})"):
-                transaction = {"type": "sales", "timestamp": date_str, "filename": fname, "items": processed_items,
-                               "source": f"remote_{ip}"}
-                self.ledger.append(transaction)
-                self.save_ledger()
-                messagebox.showinfo("Remote Sale", f"New Remote Sale received from {ip}!")
-
-        elif mode == 'inventory':
             stats, _, _, _ = self.calculate_stats(None)
-            final_items = []
-            for i in processed_items:
-                hist = stats.get(i['name'], {'in': 0, 'out': 0})
-                new_stock = (hist['in'] + i['qty']) - hist['out']
-                i['new_stock'] = new_stock
-                final_items.append(i)
+            for i in items:
+                 name = i['name']
+                 req_qty = int(i['qty'])
+                 hist = stats.get(name, {'in': 0, 'out': 0})
+                 avail = hist['in'] - hist['out']
+                 if req_qty > avail:
+                     # This should have been caught by server, but if not, reject silently or log
+                     print(f"Rejected invalid stock request from {ip}")
+                     return
 
-            fname = f"Inv_REMOTE_{now.strftime('%Y%m%d-%H%M%S')}.pdf"
-            if self.generate_grouped_pdf(os.path.join(INVENTORY_FOLDER, fname), "INVENTORY RECEIPT (REMOTE)",
-                                         date_str, final_items, ["Item", "Price", "Qty Added", "New Stock"],
-                                         [1.0, 4.5, 5.5, 6.5], subtotal_indices=[2], is_inventory=True,
-                                         extra_info=f"Source: Mobile ({ip})"):
-                transaction = {"type": "inventory", "timestamp": date_str, "filename": fname, "items": final_items,
-                               "source": f"remote_{ip}"}
-                self.ledger.append(transaction)
-                self.save_ledger()
-                messagebox.showinfo("Remote Stock", f"New Remote Stock In received from {ip}!")
+        self.remote_requests.append(request_data)
+        self.refresh_remote_sidebars()
 
-        self.refresh_stock_cache()
-        current_tab = self.notebook.tab(self.notebook.select(), "text")
-        if current_tab == 'SUMMARY':
-            self.gen_view()
-        elif current_tab == 'POS (SALES)':
-            self.on_pos_sel(None)
+        # Notify user (optional sound or flash?)
+        # messagebox.showinfo("New Request", f"New {mode} request from {ip}") # Too intrusive?
+
+    def refresh_remote_sidebars(self):
+        # Refresh Inventory Sidebar
+        for i in self.inv_req_tree.get_children(): self.inv_req_tree.delete(i)
+        for req in self.remote_requests:
+            if req['mode'] == 'inventory':
+                time_str = req['timestamp'].strftime('%H:%M')
+                item_summary = f"{len(req['items'])} items"
+                self.inv_req_tree.insert("", "end", values=(time_str, req['ip'], item_summary), tags=(req['id'],))
+
+        # Refresh POS Sidebar
+        for i in self.pos_req_tree.get_children(): self.pos_req_tree.delete(i)
+        for req in self.remote_requests:
+            if req['mode'] == 'sales':
+                time_str = req['timestamp'].strftime('%H:%M')
+                item_summary = f"{len(req['items'])} items"
+                self.pos_req_tree.insert("", "end", values=(time_str, req['ip'], item_summary), tags=(req['id'],))
 
     def setup_web_server_panel(self, parent_frame):
         frame = ttk.Frame(parent_frame)
@@ -646,7 +642,8 @@ class POSSystem:
         self.device_tree.column("count", width=100)
         self.device_tree.pack(fill="both", expand=True, padx=5, pady=5)
 
-        self.generate_qr()
+        # QR is not generated initially now
+        self.qr_lbl.config(text="Click 'Generate New QR' to start LWS")
 
     def generate_qr(self):
         url = f"http://{self.local_ip}:{self.web_port}/?token={self.session_token}"
@@ -1096,7 +1093,13 @@ class POSSystem:
         # Apply Inventory Style (Orange)
         self.tab_inventory.config(style="Inventory.TFrame")
 
-        f = ttk.LabelFrame(self.tab_inventory, text="Stock In", style="Inventory.TLabelframe")
+        main_content = ttk.Frame(self.tab_inventory, style="Inventory.TFrame")
+        main_content.pack(side="left", fill="both", expand=True)
+
+        # LWS Sidebar
+        self.setup_lws_sidebar(self.tab_inventory, "inventory")
+
+        f = ttk.LabelFrame(main_content, text="Stock In", style="Inventory.TLabelframe")
         f.pack(fill="x", padx=5, pady=5)
 
         top_bar = ttk.Frame(f, style="Inventory.TFrame")
@@ -1113,7 +1116,7 @@ class POSSystem:
 
         ttk.Button(top_bar, text="Add", command=self.add_inv).pack(side="left", padx=10)
 
-        tree_frame = ttk.Frame(self.tab_inventory, style="Inventory.TFrame")
+        tree_frame = ttk.Frame(main_content, style="Inventory.TFrame")
         tree_frame.pack(fill="both", expand=True, padx=5, pady=5)
 
         scrollbar = ttk.Scrollbar(tree_frame)
@@ -1129,7 +1132,7 @@ class POSSystem:
         self.inv_tree.heading("qty", text="Qty")
         self.inv_tree.pack(fill="both", expand=True)
 
-        b = ttk.Frame(self.tab_inventory, style="Inventory.TFrame")
+        b = ttk.Frame(main_content, style="Inventory.TFrame")
         b.pack(fill="x", padx=5, pady=10)
 
         ttk.Button(b, text="COMMIT STOCK", command=self.commit_inv, style="Accent.TButton").pack(side="right", ipadx=10)
@@ -1192,7 +1195,13 @@ class POSSystem:
         # Sales Tab uses default Green Theme but we ensure it matches
         self.tab_pos.config(style="Sales.TFrame")
 
-        f = ttk.LabelFrame(self.tab_pos, text="Sale")
+        main_content = ttk.Frame(self.tab_pos, style="Sales.TFrame")
+        main_content.pack(side="left", fill="both", expand=True)
+
+        # LWS Sidebar
+        self.setup_lws_sidebar(self.tab_pos, "sales")
+
+        f = ttk.LabelFrame(main_content, text="Sale")
         f.pack(fill="x", padx=5, pady=5)
 
         input_row = ttk.Frame(f)
@@ -1212,7 +1221,7 @@ class POSSystem:
         self.lbl_stock_avail = ttk.Label(input_row, text="", foreground="blue", font=("Segoe UI", 9, "bold"))
         self.lbl_stock_avail.pack(side="left", padx=10)
 
-        tree_frame = ttk.Frame(self.tab_pos)
+        tree_frame = ttk.Frame(main_content)
         tree_frame.pack(fill="both", expand=True, padx=5, pady=5)
 
         scrollbar = ttk.Scrollbar(tree_frame)
@@ -1233,7 +1242,7 @@ class POSSystem:
         self.pos_tree.column("sub", width=70)
         self.pos_tree.pack(fill="both", expand=True)
 
-        b = ttk.Frame(self.tab_pos)
+        b = ttk.Frame(main_content)
         b.pack(fill="x", padx=5, pady=10)
 
         self.lbl_pos_total = ttk.Label(b, text="Total: 0.00", font=("Segoe UI", 14, "bold"), foreground="#d32f2f")
@@ -1242,6 +1251,139 @@ class POSSystem:
         ttk.Button(b, text="CHECKOUT", command=self.checkout, style="Accent.TButton").pack(side="right", ipadx=20)
         ttk.Button(b, text="Clear", command=self.clear_pos).pack(side="right", padx=5)
         ttk.Button(b, text="Del", command=self.del_pos_line).pack(side="right", padx=5)
+
+    def setup_lws_sidebar(self, parent_frame, mode):
+        # Create a frame for the sidebar
+        self.lws_sidebar_frame = ttk.Frame(parent_frame, width=250)
+        self.lws_sidebar_frame.pack(side="right", fill="y", padx=5, pady=5)
+        self.lws_sidebar_frame.pack_propagate(False) # Fixed width
+
+        lbl_title = ttk.Label(self.lws_sidebar_frame, text="Remote Requests", font=("Segoe UI", 10, "bold"))
+        lbl_title.pack(pady=5)
+
+        tree_frame = ttk.Frame(self.lws_sidebar_frame)
+        tree_frame.pack(fill="both", expand=True)
+
+        cols = ("time", "ip", "summary")
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
+        tree.heading("time", text="Time")
+        tree.heading("ip", text="IP")
+        tree.heading("summary", text="Items")
+        tree.column("time", width=50)
+        tree.column("ip", width=80)
+        tree.column("summary", width=80)
+        tree.pack(fill="both", expand=True)
+
+        if mode == 'inventory':
+            self.inv_req_tree = tree
+        else:
+            self.pos_req_tree = tree
+
+        btn_frame = ttk.Frame(self.lws_sidebar_frame)
+        btn_frame.pack(pady=10)
+
+        # Approve Button (Check)
+        ttk.Button(btn_frame, text="✔", width=4,
+                   command=lambda: self.action_remote_request(mode, "approve")).pack(side="left", padx=5)
+
+        # Reject Button (Cross)
+        ttk.Button(btn_frame, text="✖", width=4,
+                   command=lambda: self.action_remote_request(mode, "reject")).pack(side="left", padx=5)
+
+    def show_remote_sidebars(self):
+        # Already set up in setup_ui, but maybe we want to hide them if LWS is not running?
+        # The requirement says "When the LWS is active... will have a Local Web Server Sidebar".
+        # For simplicity, we can just leave them visible but empty, or pack/unpack.
+        # Given the layout, packing/unpacking might be complex. Let's leave them visible.
+        pass
+
+    def action_remote_request(self, mode, action):
+        tree = self.inv_req_tree if mode == 'inventory' else self.pos_req_tree
+        sel = tree.selection()
+        if not sel: return
+
+        req_id = tree.item(sel[0], 'tags')[0]
+
+        # Find request in list
+        req = next((r for r in self.remote_requests if r['id'] == req_id), None)
+        if not req: return
+
+        if action == "reject":
+            if messagebox.askyesno("Reject", "Reject this request?"):
+                self.remote_requests.remove(req)
+                self.refresh_remote_sidebars()
+        elif action == "approve":
+            # Process Request
+            self.process_approved_request(req)
+            self.remote_requests.remove(req)
+            self.refresh_remote_sidebars()
+
+    def process_approved_request(self, req):
+        mode = req['mode']
+        items = req['items']
+        ip = req['ip']
+        timestamp = req['timestamp']
+        date_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+
+        processed_items = []
+        for i in items:
+            processed_items.append({
+                "code": "",
+                "name": i['name'],
+                "price": float(i['price']),
+                "qty": int(i['qty']),
+                "subtotal": float(i.get('subtotal', 0)),
+                "category": i.get('category', 'General'),
+                "new_stock": 0
+            })
+
+        if mode == 'sales':
+            # Check stock again just in case
+            stats, _, _, _ = self.calculate_stats(None)
+            for i in processed_items:
+                hist = stats.get(i['name'], {'in': 0, 'out': 0})
+                avail = hist['in'] - hist['out']
+                if i['qty'] > avail:
+                    messagebox.showerror("Stock Error", f"Insufficient stock for {i['name']}. Cannot approve.")
+                    return
+
+            fname = f"REMOTE_{timestamp.strftime('%Y%m%d-%H%M%S')}.pdf"
+            if self.generate_grouped_pdf(os.path.join(RECEIPT_FOLDER, fname), "SALES RECEIPT (REMOTE)", date_str,
+                                         processed_items,
+                                         ["Item", "Price", "Qty", "Total"], [1.0, 4.5, 5.5, 6.5],
+                                         subtotal_indices=[2, 3], extra_info=f"Source: Mobile ({ip})"):
+                transaction = {"type": "sales", "timestamp": date_str, "filename": fname, "items": processed_items,
+                               "source": f"remote_{ip}"}
+                self.ledger.append(transaction)
+                self.save_ledger()
+                messagebox.showinfo("Approved", f"Remote Sale Approved and Processed!")
+
+        elif mode == 'inventory':
+            stats, _, _, _ = self.calculate_stats(None)
+            final_items = []
+            for i in processed_items:
+                hist = stats.get(i['name'], {'in': 0, 'out': 0})
+                new_stock = (hist['in'] + i['qty']) - hist['out']
+                i['new_stock'] = new_stock
+                final_items.append(i)
+
+            fname = f"Inv_REMOTE_{timestamp.strftime('%Y%m%d-%H%M%S')}.pdf"
+            if self.generate_grouped_pdf(os.path.join(INVENTORY_FOLDER, fname), "INVENTORY RECEIPT (REMOTE)",
+                                         date_str, final_items, ["Item", "Price", "Qty Added", "New Stock"],
+                                         [1.0, 4.5, 5.5, 6.5], subtotal_indices=[2], is_inventory=True,
+                                         extra_info=f"Source: Mobile ({ip})"):
+                transaction = {"type": "inventory", "timestamp": date_str, "filename": fname, "items": final_items,
+                               "source": f"remote_{ip}"}
+                self.ledger.append(transaction)
+                self.save_ledger()
+                messagebox.showinfo("Approved", f"Remote Stock In Approved and Processed!")
+
+        self.refresh_stock_cache()
+        current_tab = self.notebook.tab(self.notebook.select(), "text")
+        if current_tab == 'SUMMARY':
+            self.gen_view()
+        elif current_tab == 'POS (SALES)':
+            self.on_pos_sel(None)
 
     def on_pos_sel(self, e):
         sel = self.pos_prod_var.get()
@@ -1885,6 +2027,9 @@ def launch_app():
 
     def loader():
         global pd, canvas, letter, inch, PdfReader, ntplib
+        global Flask, request, jsonify, render_template_string, qrcode
+        global smtplib, ssl, MIMEText, MIMEMultipart, MIMEBase, encoders
+
         try:
             splash.update_status("Loading Data Engine (pandas)...")
             import pandas as pd
@@ -1895,6 +2040,19 @@ def launch_app():
             splash.update_status("Loading Utils...")
             from pypdf import PdfReader;
             import ntplib
+
+            splash.update_status("Loading Web Server...")
+            from flask import Flask, request, jsonify, render_template_string
+            import qrcode
+
+            splash.update_status("Loading Email Modules...")
+            import smtplib
+            import ssl
+            from email.mime.text import MIMEText
+            from email.mime.multipart import MIMEMultipart
+            from email.mime.base import MIMEBase
+            from email import encoders
+
         except Exception as e:
             messagebox.showerror("Critical Error", f"Missing Libraries: {e}");
             root.destroy();
