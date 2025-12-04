@@ -796,7 +796,7 @@ class POSSystem:
         if last_bi_date != today_str:
             resp = messagebox.askyesno("Daily Reminder",
                                        "Beginning Inventory has not been generated for today.\n"
-                                       "Do you want to generate a Weekly Summary Receipt now?")
+                                       "Do you want to generate now?")
             if resp: self.generate_beginning_inventory_report()
 
     def generate_beginning_inventory_report(self):
