@@ -1996,6 +1996,14 @@ class POSSystem:
 
 
 def launch_app():
+    # --- Close PyInstaller Splash (if active) ---
+    try:
+        import pyi_splash
+        pyi_splash.update_text("Starting Application...")
+        pyi_splash.close()
+    except ImportError:
+        pass
+
     root = tk.Tk()
     root.withdraw()
     cfg = {"splash_img": "", "cached_business_name": "MMD POS System"}
