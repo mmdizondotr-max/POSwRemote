@@ -372,7 +372,8 @@ class ReportManager:
     def generate_grouped_pdf(self, filepath: str, title: str, date_str: str, items: List[Dict],
                              col_headers: List[str], col_pos: List[float], is_summary: bool = False,
                              extra_info: str = "", subtotal_indices: List[int] = None,
-                             is_inventory: bool = False, correction_list: List[str] = None) -> bool:
+                             is_inventory: bool = False, correction_list: List[str] = None,
+                             is_bi: bool = False) -> bool:
         try:
             canvas = self.mod.canvas
             letter = self.mod.letter
@@ -455,7 +456,10 @@ class ReportManager:
                 row_txt = []
 
                 # Determine Row Data based on context
-                if is_summary:
+                if is_bi:
+                    row_txt = [item['name'][:45], str(int(item['qty']))]
+                    row_vals = [0, item['qty']]
+                elif is_summary:
                     price_txt = f"{item['price']:.2f}" if item['price'] > 0 else "-"
                     row_txt = [item['name'][:35], price_txt, str(int(item['in'])),
                                str(int(item['out'])), str(int(item['remaining'])), f"{item['sales']:.2f}"]
@@ -486,7 +490,7 @@ class ReportManager:
                 y -= 15
 
             # Final Subtotal for last category
-            if current_cat is not None and not is_inventory and not "qty_final" in (items[0] if items else {}):
+            if current_cat is not None and not is_inventory and not is_bi and not "qty_final" in (items[0] if items else {}):
                 c.setFont("Helvetica-Bold", 9)
                 c.line(col_pos[-1] * inch - 0.5 * inch, y + 2, 7.5 * inch, y + 2)
                 if subtotal_indices:
@@ -1953,48 +1957,96 @@ class POSSystem:
         today_str = datetime.datetime.now().strftime("%Y-%m-%d")
         last_bi_date = self.data_manager.config.get("last_bi_date", "")
         if last_bi_date != today_str:
-            resp = messagebox.askyesno("Daily Reminder",
-                                       "Beginning Inventory has not been generated for today.\n"
-                                       "Do you want to generate now?")
-            if resp: self.generate_beginning_inventory_report()
+            self.generate_beginning_inventory_report()
 
     def generate_beginning_inventory_report(self):
         today = datetime.datetime.now()
-        yesterday = today - datetime.timedelta(days=1)
-        start = yesterday.replace(hour=0, minute=0, second=0, microsecond=0)
-        end = yesterday.replace(hour=23, minute=59, second=59, microsecond=0)
-        period = (start, end)
-        yesterday_str = yesterday.strftime("%Y-%m-%d")
+        today_str = today.strftime("%Y-%m-%d")
 
-        data, tot, p_txt, in_c, out_c, corr_list = self.gen_view(override_period=period)
-        now = datetime.datetime.now()
-        fname = f"Summary-{now.strftime('%Y%m%d-%H%M%S')}.pdf"
+        # Capture current state (Beginning Inventory)
+        items = []
+        # Get all known products
+        all_products = self.data_manager.get_product_list()
+
+        # Include any product that has stock in cache even if not in product list (unlikely but possible if phased out)
+        cached_names = set(self.data_manager.stock_cache.keys())
+        known_names = set(p['Product Name'] for p in all_products)
+
+        for p in all_products:
+            name = p['Product Name']
+            cat = p['Product Category']
+            qty = self.data_manager.get_stock_level(name)
+            items.append({
+                "name": name,
+                "category": cat,
+                "qty": qty,
+                "price": 0, # Not used in BI
+                "subtotal": 0 # Not used in BI
+            })
+
+        # Add items that are in stock but not in the product list (orphaned/phased out)
+        for name in cached_names:
+            if name not in known_names:
+                qty = self.data_manager.get_stock_level(name)
+                if qty != 0:
+                    items.append({
+                        "name": f"{name} (Old)",
+                        "category": "Phased Out",
+                        "qty": qty,
+                        "price": 0,
+                        "subtotal": 0
+                    })
+
+        fname = f"BI-{today.strftime('%Y%m%d')}.pdf"
         full_path = os.path.join(SUMMARY_FOLDER, fname)
 
         success = self.report_manager.generate_grouped_pdf(
-            full_path, "INVENTORY & SALES SUMMARY",
-            now.strftime('%Y-%m-%d %H:%M:%S'), data,
-            ["Product", "Price", "Added", "Sold", "Stock", "Sales"],
-            [1.0, 4.5, 5.2, 5.9, 6.6, 7.3], is_summary=True,
-            extra_info=f"Period: {yesterday_str} (Daily) | In: {in_c} | Out: {out_c}",
-            subtotal_indices=[2, 3, 5], correction_list=corr_list
+            full_path, "BEGINNING INVENTORY",
+            today.strftime('%Y-%m-%d %H:%M:%S'), items,
+            ["Product", "Qty"],
+            [1.0, 6.0], is_summary=False,
+            extra_info=f"Start of Day: {today_str}",
+            is_bi=True
         )
+
         if success:
             self.data_manager.summary_count += 1
             self.data_manager.save_ledger()
-            self.data_manager.config["last_bi_date"] = today.strftime("%Y-%m-%d")
+            self.data_manager.config["last_bi_date"] = today_str
             self.data_manager.save_config()
-
-            note = f"Note: This is an automated Beginning Inventory report for {yesterday_str}."
 
             recipient = self.data_manager.config.get("recipient_email", "").strip()
             if recipient:
-                self.email_manager.trigger_summary_email(
-                    recipient, full_path, LEDGER_FILE, self.data_manager.business_name,
-                    self.data_manager.summary_count, self.session_user, extra_body=note
+                # Mock a summary email call but override subject/body via extra_body if possible,
+                # or better yet, since trigger_summary_email generates a fixed subject format,
+                # we might want to manually send it or accept the format.
+                # The user asked for "Beginning Inventory" in subject/body.
+                # trigger_summary_email uses "[count]_TITLE_BIZ_DATE" subject format.
+                # I should manually send it to respect the "Beginning Inventory" requirement if trigger_summary_email is too rigid.
+
+                # However, trigger_summary_email is convenient. Let's look at it.
+                # Subject: [{count:04d}]_{APP_TITLE}_{safe_biz_name}_{date_str}
+                # Body: "Summary & Ledger..."
+
+                # I will call email_manager.send_email_thread directly to customize fully as requested.
+
+                safe_biz_name = "".join(c for c in self.data_manager.business_name if c.isalnum() or c in (' ', '_', '-')).strip()
+                subject = f"Beginning Inventory - {safe_biz_name} - {today_str}"
+                body = (f"Beginning Inventory Report.\n\n"
+                        f"User: {self.session_user}\n"
+                        f"Counter: {self.data_manager.summary_count:04d}\n"
+                        f"Date: {today_str}\n\n"
+                        f"Please find the Beginning Inventory PDF and Ledger database attached.")
+
+                self.email_manager.send_email_thread(
+                    recipient, subject, body,
+                    [full_path, LEDGER_FILE]
                 )
-            messagebox.showinfo("Auto-Gen",
-                                f"Beginning Inventory for {yesterday_str} generated & emailed.\nReceipt: {fname}")
+
+            # Optional: Silent or unobtrusive notification
+            # self.root.after(500, lambda: messagebox.showinfo("Info", "Beginning Inventory generated."))
+            # User said "automatically". Usually implies silent, but I'll print to console or status if I had one.
+            print(f"Beginning Inventory generated: {fname}")
 
 
 # --- SPLASH SCREEN ---
