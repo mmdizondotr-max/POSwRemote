@@ -109,7 +109,8 @@ class DataManager:
             "previous_products": [],
             "recipient_email": "",
             "last_bi_date": "",
-            "touch_mode": False
+            "touch_mode": False,
+            "last_email_sync": ""
         }
         if os.path.exists(CONFIG_FILE):
             try:
@@ -373,13 +374,17 @@ class ReportManager:
                              col_headers: List[str], col_pos: List[float], is_summary: bool = False,
                              extra_info: str = "", subtotal_indices: List[int] = None,
                              is_inventory: bool = False, correction_list: List[str] = None,
-                             is_bi: bool = False) -> bool:
+                             is_bi: bool = False, canvas_obj: Any = None) -> bool:
         try:
             canvas = self.mod.canvas
             letter = self.mod.letter
             inch = self.mod.inch
 
-            c = canvas.Canvas(filepath, pagesize=letter)
+            if canvas_obj:
+                c = canvas_obj
+            else:
+                c = canvas.Canvas(filepath, pagesize=letter)
+
             width, height = letter
             y = height - 1 * inch
 
@@ -532,10 +537,50 @@ class ReportManager:
                     c.drawString(1.2 * inch, y, f"- {cf}")
                     y -= 12
 
-            c.save()
+            if not canvas_obj:
+                c.save()
             return True
         except Exception as e:
             messagebox.showerror("PDF Error", str(e))
+            return False
+
+    def generate_catchup_report(self, filepath: str, intervals: List[Tuple[datetime.datetime, datetime.datetime]],
+                                data_manager: 'DataManager', get_stats_func) -> bool:
+        try:
+            canvas = self.mod.canvas
+            letter = self.mod.letter
+            c = canvas.Canvas(filepath, pagesize=letter)
+
+            for idx, (start, end) in enumerate(intervals):
+                # Calculate stats for this specific interval
+                # We reuse the logic from get_sum_data but we need to inject the period
+                # Since get_sum_data is in POSSystem, we will need to replicate aggregation logic here or pass a callback
+                # Ideally, we pass a callback that returns the formatted data rows for a given period
+
+                rows, in_c, out_c, corr_list = get_stats_func(period=(start, end))
+
+                title = f"CATCHUP SUMMARY ({idx+1}/3)"
+                date_str = f"{start.strftime('%Y-%m-%d %H:%M')} to {end.strftime('%Y-%m-%d %H:%M')}"
+
+                self.generate_grouped_pdf(
+                    filepath="", # Not used when canvas_obj is passed
+                    title=title,
+                    date_str=date_str,
+                    items=rows,
+                    col_headers=["Product", "Price", "Added", "Sold", "Stock", "Sales"],
+                    col_pos=[1.0, 4.5, 5.2, 5.9, 6.6, 7.3],
+                    is_summary=True,
+                    extra_info=f"Interval {idx+1} | In: {in_c} | Out: {out_c}",
+                    subtotal_indices=[2, 3, 5],
+                    correction_list=corr_list,
+                    canvas_obj=c
+                )
+                c.showPage()
+
+            c.save()
+            return True
+        except Exception as e:
+            print(f"Catchup Report Error: {e}")
             return False
 
 # --- EMAIL MANAGER ---
@@ -587,7 +632,17 @@ class EmailManager:
                     server.login(SENDER_EMAIL, SENDER_PASSWORD)
                     server.sendmail(SENDER_EMAIL, recipient, msg.as_string())
 
-                if on_success: on_success()
+                # Execute success callback if provided
+                if on_success:
+                    try:
+                        # Schedule in main thread if it involves UI or critical data that shouldn't race
+                        # But for config saving (simple file I/O), running in thread is acceptable
+                        # as long as DataManager isn't thread-hostile.
+                        # DataManager.save_config is just json.dump, which is atomic enough for this use case.
+                        on_success()
+                    except Exception as callback_err:
+                        print(f"Email callback error: {callback_err}")
+
                 print(f"Email sent successfully to {recipient}")
 
             except Exception as e:
@@ -598,7 +653,8 @@ class EmailManager:
         threading.Thread(target=task, daemon=True).start()
 
     def trigger_summary_email(self, recipient: str, summary_pdf_path: str, ledger_path: str,
-                              business_name: str, count: int, user: str, extra_body: str = "") -> None:
+                              business_name: str, count: int, user: str, extra_body: str = "",
+                              extra_attachments: List[str] = None, on_success: Any = None) -> None:
         if not recipient: return
 
         date_str = datetime.datetime.now().strftime("%Y%m%d")
@@ -611,7 +667,10 @@ class EmailManager:
                 f"{extra_body}")
 
         attachments = [summary_pdf_path, ledger_path]
-        self.send_email_thread(recipient, subject, body, attachments)
+        if extra_attachments:
+            attachments.extend(extra_attachments)
+
+        self.send_email_thread(recipient, subject, body, attachments, on_success=on_success)
 
 # --- WEB SERVER THREAD ---
 class WebServerThread(threading.Thread):
@@ -1255,7 +1314,13 @@ class POSSystem:
 
     def get_sum_data(self, override_period=None):
         global_stats, _, _, _ = self.data_manager.calculate_stats(None)
-        period = override_period if override_period else self.get_period_dates()
+
+        # Use filtered period if override_period provided, otherwise get from UI selection
+        if override_period:
+            period = override_period
+        else:
+            period = self.get_period_dates()
+
         period_stats, in_c, out_c, corr_list = self.data_manager.calculate_stats(period)
 
         rows = []
@@ -1287,7 +1352,12 @@ class POSSystem:
                 show_rem = rem_stock if price == curr_price else 0
 
                 # Filter Logic
-                if self.report_type.get() != "All Time":
+                # If using override_period (catchup), we behave like a specific period report (hide zeros)
+                # If UI selected "All Time", we show everything including zero movement items if they exist in inventory
+
+                is_all_time = (self.report_type.get() == "All Time") and (override_period is None)
+
+                if not is_all_time:
                     if data['in'] == 0 and data['out'] == 0: continue
                 elif data['in'] == 0 and data['out'] == 0 and show_rem == 0 and name not in set(
                         self.data_manager.products_df['Product Name']):
@@ -1358,14 +1428,96 @@ class POSSystem:
 
                 recipient = self.data_manager.config.get("recipient_email", "").strip()
                 if recipient:
+                    extra_attachments = []
+
+                    # CATCHUP LOGIC
+                    catchup_start = self.get_catchup_start_time()
+                    if catchup_start:
+                        catchup_intervals = self.get_catchup_intervals(catchup_start, now)
+                        if catchup_intervals:
+                            catchup_fname = f"Catchup_{now.strftime('%Y%m%d-%H%M%S')}.pdf"
+                            catchup_path = os.path.join(SUMMARY_FOLDER, catchup_fname)
+
+                            # We pass get_sum_data (wrapper) to generate_catchup_report
+                            # get_sum_data requires 'period' as override
+                            # But get_sum_data signature is (self, override_period=None)
+                            # so we can use a lambda
+                            c_success = self.report_manager.generate_catchup_report(
+                                catchup_path,
+                                catchup_intervals,
+                                self.data_manager,
+                                lambda period: self.get_sum_data(override_period=period)
+                            )
+                            if c_success:
+                                extra_attachments.append(catchup_path)
+
                     self.email_manager.trigger_summary_email(
                         recipient, full_path, LEDGER_FILE, self.data_manager.business_name,
-                        self.data_manager.summary_count, self.session_user
+                        self.data_manager.summary_count, self.session_user,
+                        extra_attachments=extra_attachments,
+                        on_success=self.update_email_sync_timestamp
                     )
 
                 messagebox.showinfo("Success", f"Summary Generated & Sent.\nReceipt: {fname}")
             else:
                 messagebox.showinfo("History Generated", f"Historical PDF Generated (No Email/Counter).\nFile: {fname}")
+
+    def get_catchup_start_time(self) -> Optional[datetime.datetime]:
+        """Finds the timestamp of the oldest unsent Summary/History receipt."""
+        last_sync_str = self.data_manager.config.get("last_email_sync", "")
+        last_sync_dt = None
+        if last_sync_str:
+            try:
+                last_sync_dt = datetime.datetime.strptime(last_sync_str, "%Y-%m-%d %H:%M:%S")
+            except:
+                pass # Invalid or empty, treat as never synced (or start from beginning?)
+
+        # Regex to match filenames like Summary-YYYYMMDD-HHMMSS.pdf
+        # Note: History- files are usually manual and maybe shouldn't count?
+        # User said "summarizes all Summary Receipts generated but were not sent".
+        # Let's stick to "Summary-*" files which are the official automated ones.
+
+        candidates = []
+        try:
+            for f in os.listdir(SUMMARY_FOLDER):
+                if f.startswith("Summary-") and f.endswith(".pdf"):
+                    # Extract date
+                    try:
+                        part = f.replace("Summary-", "").replace(".pdf", "")
+                        dt = datetime.datetime.strptime(part, "%Y%m%d-%H%M%S")
+
+                        if last_sync_dt is None or dt > last_sync_dt:
+                            candidates.append(dt)
+                    except:
+                        pass
+        except Exception as e:
+            print(f"Error scanning summary folder: {e}")
+
+        if not candidates:
+            return None
+
+        return min(candidates)
+
+    def get_catchup_intervals(self, start: datetime.datetime, end: datetime.datetime) -> List[Tuple[datetime.datetime, datetime.datetime]]:
+        total_duration = end - start
+        if total_duration.total_seconds() < 60:
+            return [] # Too short to bother
+
+        segment = total_duration / 3
+
+        i1_end = start + segment
+        i2_end = i1_end + segment
+
+        return [
+            (start, i1_end),
+            (i1_end, i2_end),
+            (i2_end, end)
+        ]
+
+    def update_email_sync_timestamp(self):
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.data_manager.config["last_email_sync"] = now_str
+        self.data_manager.save_config()
 
     # --- SETTINGS TAB ---
     def setup_settings_tab(self):
