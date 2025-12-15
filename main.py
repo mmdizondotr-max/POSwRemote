@@ -509,16 +509,17 @@ class ReportManager:
                 y -= 30
 
             # Grand Total
-            c.line(1 * inch, y + 10, 7.5 * inch, y + 10)
-            c.setFont("Helvetica-Bold", 12)
-            lbl = ""
-            if is_summary:
-                lbl = f"TOTAL SALES: {grand_sums[5]:.2f}"
-            elif items and "subtotal" in items[0]:
-                lbl = f"TOTAL AMOUNT: {grand_sums[3]:.2f}"
-            elif is_inventory:
-                lbl = f"TOTAL ADDED: {int(grand_sums[2])}"
-            c.drawString(4.5 * inch, y, lbl)
+            if not is_bi:
+                c.line(1 * inch, y + 10, 7.5 * inch, y + 10)
+                c.setFont("Helvetica-Bold", 12)
+                lbl = ""
+                if is_summary:
+                    lbl = f"TOTAL SALES: {grand_sums[5]:.2f}"
+                elif items and "subtotal" in items[0]:
+                    lbl = f"TOTAL AMOUNT: {grand_sums[3]:.2f}"
+                elif is_inventory:
+                    lbl = f"TOTAL ADDED: {int(grand_sums[2])}"
+                c.drawString(4.5 * inch, y, lbl)
 
             # Corrections List (Summary only)
             if is_summary and correction_list:
