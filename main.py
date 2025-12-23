@@ -16,7 +16,7 @@ from typing import Optional, List, Dict, Any, Tuple, Union, Set
 from PIL import Image, ImageTk
 from style_manager import StyleManager
 
-# pyinstaller --onefile --noconsole --splash splash_image.png main.py
+# pyinstaller --onefile --noconsole --splash splash_image2.png main.py
 
 # --- CONFIGURATION CONSTANTS ---
 APP_DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MMD_POS_System")
