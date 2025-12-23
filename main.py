@@ -35,7 +35,7 @@ CORRECTION_FOLDER = "correctionreceipts"
 DATA_FILE = "products.xlsx"
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
 LEDGER_FILE = os.path.join(APP_DATA_DIR, "ledger.json")
-APP_TITLE = "MMD Portable PoS v15.0"  # Refactored Version
+APP_TITLE = "MMD Inventory Tracker v15.0"  # Refactored Version
 
 # --- EMAIL CONFIGURATION ---
 SMTP_SERVER = "smtp.gmail.com"
