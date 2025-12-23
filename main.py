@@ -19,13 +19,22 @@ from style_manager import StyleManager
 # pyinstaller --onefile --noconsole --splash splash_image.png main.py
 
 # --- CONFIGURATION CONSTANTS ---
+APP_DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MMD_POS_System")
+BACKUP_DIR = os.path.join(APP_DATA_DIR, "backups")
+
+# Ensure app data directories exist
+if not os.path.exists(APP_DATA_DIR):
+    os.makedirs(APP_DATA_DIR)
+if not os.path.exists(BACKUP_DIR):
+    os.makedirs(BACKUP_DIR)
+
 RECEIPT_FOLDER = "receipts"
 INVENTORY_FOLDER = "inventoryreceipts"
 SUMMARY_FOLDER = "summaryreceipts"
 CORRECTION_FOLDER = "correctionreceipts"
 DATA_FILE = "products.xlsx"
-CONFIG_FILE = "config.json"
-LEDGER_FILE = "ledger.json"
+CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
+LEDGER_FILE = os.path.join(APP_DATA_DIR, "ledger.json")
 APP_TITLE = "MMD Portable PoS v14.1"  # Refactored Version
 
 # --- EMAIL CONFIGURATION ---
@@ -97,6 +106,7 @@ class DataManager:
         self.config: Dict = {}
 
         self.load_config()
+        self.create_rolling_backup()
         self.load_ledger()
         self.load_products()
         self.refresh_stock_cache()
@@ -148,6 +158,32 @@ class DataManager:
         # but to keep JSON compatibility simple, we'll parse on demand or keep a shadow index if needed.
         # For <10k records, on-demand parsing in calculate_stats is usually fine, but let's be careful.
 
+    def create_rolling_backup(self) -> None:
+        """Creates a rolling backup of the ledger file."""
+        if not os.path.exists(LEDGER_FILE):
+            return
+
+        try:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup_name = f"ledger_backup_{timestamp}.json"
+            backup_path = os.path.join(BACKUP_DIR, backup_name)
+
+            shutil.copy2(LEDGER_FILE, backup_path)
+
+            # Cleanup old backups (Keep 10 most recent)
+            backups = [
+                os.path.join(BACKUP_DIR, f)
+                for f in os.listdir(BACKUP_DIR)
+                if f.startswith("ledger_backup_") and f.endswith(".json")
+            ]
+            backups.sort(key=os.path.getctime)
+
+            while len(backups) > 10:
+                os.remove(backups.pop(0))
+
+        except Exception as e:
+            print(f"Backup Error: {e}")
+
     def save_ledger(self) -> None:
         try:
             data = {
@@ -155,8 +191,16 @@ class DataManager:
                 "summary_count": self.summary_count,
                 "shortcuts_asked": self.shortcuts_asked
             }
-            with open(LEDGER_FILE, 'w') as f:
+
+            # Atomic Write
+            temp_file = LEDGER_FILE + ".tmp"
+            with open(temp_file, 'w') as f:
                 json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(temp_file, LEDGER_FILE)
+
         except Exception as e:
             messagebox.showerror("Save Error", f"Could not save database: {e}")
 
@@ -249,6 +293,7 @@ class DataManager:
         if ref_type: transaction['ref_type'] = ref_type
         if ref_filename: transaction['ref_filename'] = ref_filename
 
+        self.create_rolling_backup()
         self.ledger.append(transaction)
         self.save_ledger()
         self.refresh_stock_cache()
