@@ -96,6 +96,7 @@ class DataManager:
         self.mod = modules
         self.products_df: Any = None  # Pandas DataFrame
         self.ledger: List[Dict] = []
+        self.product_history: List[Dict] = []
         self.summary_count: int = 0
         self.shortcuts_asked: bool = False
         self.business_name: str = "My Business"
@@ -147,12 +148,15 @@ class DataManager:
                         self.ledger = data
                         self.summary_count = 0
                         self.shortcuts_asked = False
+                        self.product_history = []
                     elif isinstance(data, dict):
                         self.ledger = data.get("transactions", [])
                         self.summary_count = data.get("summary_count", 0)
                         self.shortcuts_asked = data.get("shortcuts_asked", False)
+                        self.product_history = data.get("product_history", [])
             except:
                 self.ledger = []
+                self.product_history = []
 
         # Optimization: Pre-parse dates could happen here if we used custom objects,
         # but to keep JSON compatibility simple, we'll parse on demand or keep a shadow index if needed.
@@ -189,7 +193,8 @@ class DataManager:
             data = {
                 "transactions": self.ledger,
                 "summary_count": self.summary_count,
-                "shortcuts_asked": self.shortcuts_asked
+                "shortcuts_asked": self.shortcuts_asked,
+                "product_history": self.product_history
             }
 
             # Atomic Write
@@ -265,6 +270,33 @@ class DataManager:
                 rejected_count += 1
 
         self.products_df = pd.DataFrame(valid_products)
+
+        # --- Product History Versioning ---
+        current_list = self.products_df.to_dict('records')
+
+        should_save_history = False
+        if not self.product_history:
+            should_save_history = True
+        else:
+            # Compare with latest
+            # Simple check: json dumps comparison to ensure deep equality including order if sorted,
+            # but list order matters in excel, so direct comparison is fine.
+            # However, we must ensure we are comparing compatible structures.
+            # 'records' gives list of dicts.
+            last_version = self.product_history[-1].get('items', [])
+            if current_list != last_version:
+                should_save_history = True
+
+        if should_save_history and current_list:
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.product_history.append({
+                "timestamp": timestamp,
+                "items": current_list
+            })
+            # Keep only last 4 versions (Current + 3 past)
+            if len(self.product_history) > 4:
+                self.product_history = self.product_history[-4:]
+            self.save_ledger()
 
         # Stats
         previous_products = set(self.config.get("previous_products", []))
@@ -1614,6 +1646,13 @@ class POSSystem:
         ttk.Button(bf, text="Restore (.json)", command=self.restore_data_json).pack(side="left", padx=5)
 
         ttk.Separator(f, orient='horizontal').pack(fill='x', pady=10)
+        ttk.Label(f, text="Maintenance", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        mf = ttk.Frame(f)
+        mf.pack(anchor="w", pady=5)
+        ttk.Button(mf, text="Harmonize Receipts", command=lambda: self.harmonize_receipts(silent=False)).pack(side="left", padx=5)
+        ttk.Button(mf, text="Restore Products File", command=self.regenerate_products_file).pack(side="left", padx=5)
+
+        ttk.Separator(f, orient='horizontal').pack(fill='x', pady=10)
         ttk.Button(f, text="Load Test (Dev)", command=self.run_load_test, style="Danger.TButton").pack(anchor="w", pady=5)
 
         # Web Server Panel
@@ -1728,6 +1767,20 @@ class POSSystem:
                     except Exception:
                         pass # Non-critical
 
+            self.harmonize_receipts(silent=True)
+            self.data_manager.save_ledger()
+            self.data_manager.refresh_stock_cache()
+            messagebox.showinfo("Success", f"Restored {len(self.data_manager.ledger)} records.")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed: {e}")
+
+    def harmonize_receipts(self, silent: bool = False):
+        if not silent:
+            if not messagebox.askyesno("Confirm", "This will DELETE and REGENERATE all PDF receipts from the database.\nContinue?"):
+                return
+
+        try:
             # Regenerate Receipts
             for folder in [INVENTORY_FOLDER, RECEIPT_FOLDER, CORRECTION_FOLDER]:
                 if os.path.exists(folder): shutil.rmtree(folder); os.makedirs(folder)
@@ -1762,12 +1815,87 @@ class POSSystem:
                         pdf_items, ["Item", "Orig", "Adj", "Final"], [1.0, 4.5, 5.5, 6.5]
                     )
 
-            self.data_manager.save_ledger()
-            self.data_manager.refresh_stock_cache()
-            messagebox.showinfo("Success", f"Restored {len(self.data_manager.ledger)} records.")
+            if not silent:
+                messagebox.showinfo("Success", "All receipts harmonized with ledger.")
 
         except Exception as e:
-            messagebox.showerror("Error", f"Failed: {e}")
+            if not silent:
+                messagebox.showerror("Error", f"Harmonization Failed: {e}")
+            else:
+                raise e
+
+    def regenerate_products_file(self):
+        history = self.data_manager.product_history
+        if not history or len(history) < 2:
+            messagebox.showinfo("History", "No previous product versions available.")
+            return
+
+        # Show versions (excluding the very last one which is current)
+        # candidates are history[:-1] if we assume the last one is always current.
+        # But wait, history[-1] is the one loaded *now*.
+        # If the user changed the file externally and opened the app, history[-1] matches the file.
+        # The user wants "past 3 versions prior to the current version".
+
+        # If we have [A, B, C, D(current)], we want user to pick from C, B, A.
+        # So we slice history[:-1] and reverse it to show newest first.
+        candidates = history[:-1]
+        if not candidates:
+             messagebox.showinfo("History", "No *past* versions available.")
+             return
+
+        # Create a simple dialog
+        win = tk.Toplevel(self.root)
+        win.title("Select Version")
+        win.geometry("400x300")
+
+        ttk.Label(win, text="Select a past version to restore:", font=("Segoe UI", 10, "bold")).pack(pady=10)
+
+        tree = ttk.Treeview(win, columns=("ts", "count"), show="headings")
+        tree.heading("ts", text="Timestamp")
+        tree.heading("count", text="Items")
+        tree.column("ts", width=200)
+        tree.column("count", width=80)
+        tree.pack(fill="both", expand=True, padx=10, pady=5)
+
+        # Sort candidates newest first
+        sorted_candidates = sorted(candidates, key=lambda x: x['timestamp'], reverse=True)
+
+        # Limit to 3 as requested
+        sorted_candidates = sorted_candidates[:3]
+
+        for ver in sorted_candidates:
+            tree.insert("", "end", values=(ver['timestamp'], len(ver['items'])), tags=(json.dumps(ver),))
+
+        def restore():
+            sel = tree.selection()
+            if not sel: return
+
+            data_str = tree.item(sel[0], 'tags')[0]
+            version_data = json.loads(data_str)
+            items = version_data.get('items', [])
+
+            if not items:
+                messagebox.showerror("Error", "Selected version has no items.")
+                return
+
+            if messagebox.askyesno("Confirm", f"Restore products from {version_data['timestamp']}?\nThis will overwrite products.xlsx."):
+                try:
+                    df = self.mod.pd.DataFrame(items)
+                    # Ensure column order if possible, though not strictly required by load_products
+                    # load_products expects Business Name, Product Category, Product Name, Price
+                    df.to_excel(DATA_FILE, index=False)
+                    self.data_manager.load_products()
+
+                    # Update UI Dropdowns
+                    self.inv_dropdown['values'] = self.get_dropdown_values()
+                    self.pos_dropdown['values'] = self.get_dropdown_values()
+
+                    messagebox.showinfo("Success", "Products restored and reloaded.")
+                    win.destroy()
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to restore: {e}")
+
+        ttk.Button(win, text="Restore Selected", command=restore).pack(pady=10)
 
     def run_load_test(self):
         pwd = simpledialog.askstring("Load Test", "Enter Password:", show="*")
