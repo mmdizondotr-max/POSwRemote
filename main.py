@@ -972,7 +972,7 @@ class POSSystem:
     def get_dropdown_values(self) -> List[str]:
         # Helper to get formatted "Name (Price)" list
         if self.data_manager.products_df.empty: return []
-        sorted_df = self.data_manager.products_df.sort_values(by=["Product Category", "Product Name"])
+        sorted_df = self.data_manager.products_df.sort_values(by=["Product Name"])
         # Use truncated name
         return sorted_df.apply(lambda x: f"{truncate_product_name(x['Product Name'])} ({x['Price']:.2f})", axis=1).tolist()
 
@@ -1002,12 +1002,6 @@ class POSSystem:
             else:
                 filtered = [item for item in all_values if value.lower() in item.lower()]
                 combo['values'] = filtered
-
-                if filtered:
-                    try:
-                        combo.event_generate('<Down>')
-                    except:
-                        pass
 
         combo.bind('<FocusIn>', on_focus)
         combo.bind('<KeyRelease>', on_keyrelease)
@@ -2376,8 +2370,9 @@ class POSSystem:
         try:
             desktop = os.path.normpath(os.path.join(os.environ['USERPROFILE'], 'Desktop'))
             exe_path = sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__)
+            exe_dir = os.path.dirname(exe_path)
             link_name = f"{APP_TITLE}.lnk"
-            self.create_shortcut_vbs(exe_path, os.path.join(desktop, link_name))
+            self.create_shortcut_vbs(exe_path, os.path.join(desktop, link_name), working_dir=exe_dir)
 
             folder_path = os.path.abspath(SUMMARY_FOLDER)
             folder_link_name = "Summary Receipts.lnk"
@@ -2386,11 +2381,13 @@ class POSSystem:
         except Exception as e:
             messagebox.showerror("Shortcut Error", f"Could not create shortcuts: {e}")
 
-    def create_shortcut_vbs(self, target, link_path):
+    def create_shortcut_vbs(self, target, link_path, working_dir=None):
+        work_dir_line = f'oLink.WorkingDirectory = "{working_dir}"' if working_dir else ""
         vbs_content = f"""
             Set oWS = WScript.CreateObject("WScript.Shell")
             Set oLink = oWS.CreateShortcut("{link_path}")
             oLink.TargetPath = "{target}"
+            {work_dir_line}
             oLink.Save
         """
         vbs_path = os.path.join(os.environ["TEMP"], "create_shortcut.vbs")
