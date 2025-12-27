@@ -48,6 +48,12 @@ for folder in [RECEIPT_FOLDER, INVENTORY_FOLDER, SUMMARY_FOLDER, CORRECTION_FOLD
     if not os.path.exists(folder):
         os.makedirs(folder)
 
+# --- UTILS ---
+def truncate_product_name(name: str) -> str:
+    if len(name) > 25:
+        return name[:15] + name[-10:]
+    return name
+
 # --- DEPENDENCY CONTAINER ---
 class AppModules:
     """
@@ -104,6 +110,7 @@ class DataManager:
 
         # Caches
         self.stock_cache: Dict[str, Dict] = {}
+        self.name_lookup_cache: Dict[str, Dict] = {}
         self.config: Dict = {}
 
         self.load_config()
@@ -260,12 +267,19 @@ class DataManager:
             if is_valid:
                 seen_names.add(name)
                 b_name = str(row.get('Business Name', self.business_name))
-                valid_products.append({
+                entry = {
                     "Business Name": b_name,
                     "Product Category": cat,
                     "Product Name": name,
                     "Price": price
-                })
+                }
+                valid_products.append(entry)
+
+                # Populate Lookup Cache
+                self.name_lookup_cache[name] = entry
+                truncated = truncate_product_name(name)
+                self.name_lookup_cache[truncated] = entry
+
             else:
                 rejected_count += 1
 
@@ -414,11 +428,10 @@ class DataManager:
         """Returns (code, name, price, category)"""
         if not selection_string: return "", None, 0, "Uncategorized"
 
-        # Try exact match first
-        exact_row = self.products_df[self.products_df['Product Name'] == selection_string]
-        if not exact_row.empty:
-            row = exact_row.iloc[0]
-            return "", row['Product Name'], float(row['Price']), row['Product Category']
+        # Try direct lookup in cache (Exact Full Name or Truncated Name)
+        if selection_string in self.name_lookup_cache:
+            item = self.name_lookup_cache[selection_string]
+            return "", item['Product Name'], float(item['Price']), item['Product Category']
 
         # Try parsing "Name (Price)" format
         try:
@@ -426,11 +439,12 @@ class DataManager:
         except:
             name_part = selection_string
 
-        item_row = self.products_df[self.products_df['Product Name'] == name_part]
-        if not item_row.empty:
-            row = item_row.iloc[0]
-            return "", row['Product Name'], float(row['Price']), row['Product Category']
+        if name_part in self.name_lookup_cache:
+            item = self.name_lookup_cache[name_part]
+            return "", item['Product Name'], float(item['Price']), item['Product Category']
 
+        # Fallback for old items not in current product list but in ledger (Phased Out)
+        # We rely on what was passed if possible, or return Phased Out
         return "", "Unknown Item", 0.0, "Phased Out"
 
     def get_stock_level(self, name: str) -> int:
@@ -927,7 +941,47 @@ class POSSystem:
         # Helper to get formatted "Name (Price)" list
         if self.data_manager.products_df.empty: return []
         sorted_df = self.data_manager.products_df.sort_values(by=["Product Category", "Product Name"])
-        return sorted_df.apply(lambda x: f"{x['Product Name']} ({x['Price']:.2f})", axis=1).tolist()
+        # Use truncated name
+        return sorted_df.apply(lambda x: f"{truncate_product_name(x['Product Name'])} ({x['Price']:.2f})", axis=1).tolist()
+
+    def setup_searchable_combobox(self, combo):
+        """Enables typing to filter the combobox values."""
+        # Attach a cache to the widget instance to avoid re-fetching on every key stroke
+        combo._search_cache = []
+
+        def on_focus(event):
+            # Refresh cache when user focuses
+            combo._search_cache = self.get_dropdown_values()
+
+        def on_keyrelease(event):
+            # Ignore navigation keys
+            if event.keysym in ('Up', 'Down', 'Return', 'Tab', 'Left', 'Right', 'Escape'): return
+
+            value = event.widget.get()
+
+            # Lazy load if empty (should have been loaded on focus, but safety check)
+            if not combo._search_cache:
+                combo._search_cache = self.get_dropdown_values()
+
+            all_values = combo._search_cache
+
+            if value == '':
+                combo['values'] = all_values
+            else:
+                filtered = [item for item in all_values if value.lower() in item.lower()]
+                combo['values'] = filtered
+
+                # Optional: Force dropdown open if matches found (User preference dependent, can be omitted if annoying)
+                if filtered:
+                    try:
+                        # Only open if not already open? Tkinter doesn't expose 'is_dropped_down' easily.
+                        # We just let user press Down arrow to see list.
+                        pass
+                    except:
+                        pass
+
+        combo.bind('<FocusIn>', on_focus)
+        combo.bind('<KeyRelease>', on_keyrelease)
 
     def show_startup_report(self):
         self.root.update()
@@ -955,6 +1009,7 @@ class POSSystem:
         self.inv_prod_var = tk.StringVar()
         self.inv_dropdown = ttk.Combobox(top_bar, textvariable=self.inv_prod_var, width=45)
         self.inv_dropdown['values'] = self.get_dropdown_values()
+        self.setup_searchable_combobox(self.inv_dropdown)
         self.inv_dropdown.pack(side="left", padx=5)
 
         ttk.Label(top_bar, text="Qty:", style="Inventory.TLabel").pack(side="left")
@@ -1057,6 +1112,7 @@ class POSSystem:
         self.pos_prod_var = tk.StringVar()
         self.pos_dropdown = ttk.Combobox(input_row, textvariable=self.pos_prod_var, width=45)
         self.pos_dropdown['values'] = self.get_dropdown_values()
+        self.setup_searchable_combobox(self.pos_dropdown)
         self.pos_dropdown.pack(side="left", padx=5)
         self.pos_dropdown.bind("<<ComboboxSelected>>", self.on_pos_sel)
 
