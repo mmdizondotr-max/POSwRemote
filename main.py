@@ -237,6 +237,23 @@ class DataManager:
             self.products_df = pd.DataFrame(columns=req_cols)
             return
 
+        # --- Data Cleanup & Normalization ---
+        def clean_text(text_val):
+            if pd.isna(text_val): return ""
+            s = str(text_val).upper()
+            s = s.replace("'", "")       # Remove apostrophes
+            s = s.replace("\n", " ")     # Single line
+            s = re.sub(r'\s+', ' ', s)   # Remove double spaces
+            return s.strip()
+
+        if 'Product Name' in raw_df.columns:
+            raw_df['Product Name'] = raw_df['Product Name'].apply(clean_text)
+        if 'Product Category' in raw_df.columns:
+            raw_df['Product Category'] = raw_df['Product Category'].apply(clean_text)
+
+        if 'Remarks' not in raw_df.columns:
+            raw_df['Remarks'] = ""
+
         # Business Name Logic
         if "Business Name" in raw_df.columns and not raw_df.empty:
             val = str(raw_df.iloc[0]["Business Name"]).strip()
@@ -246,11 +263,12 @@ class DataManager:
 
         valid_products = []
         seen_names = set()
-        rejected_count = 0
+        rejected_details = []
+        remarks_updates = []
 
         for index, row in raw_df.iterrows():
-            cat = str(row.get('Product Category', '')).strip()
-            name = str(row.get('Product Name', '')).strip()
+            cat = str(row.get('Product Category', ''))
+            name = str(row.get('Product Name', ''))
             raw_price = row.get('Price', 0)
 
             try:
@@ -258,13 +276,13 @@ class DataManager:
             except:
                 price = 0.0
 
-            is_valid = True
-            if price <= 0 or pd.isna(raw_price): is_valid = False
-            if not cat or cat.lower() == 'nan': is_valid = False
-            if name in seen_names: is_valid = False
-            if not name or name.lower() == 'nan': is_valid = False
+            rejection_reason = None
+            if price <= 0 or pd.isna(raw_price): rejection_reason = "Price <= 0"
+            elif not cat or cat == 'NAN': rejection_reason = "Invalid Category"
+            elif not name or name == 'NAN': rejection_reason = "Invalid Name"
+            elif name in seen_names: rejection_reason = "Duplicate Name"
 
-            if is_valid:
+            if rejection_reason is None:
                 seen_names.add(name)
                 b_name = str(row.get('Business Name', self.business_name))
                 entry = {
@@ -280,8 +298,21 @@ class DataManager:
                 truncated = truncate_product_name(name)
                 self.name_lookup_cache[truncated] = entry
 
+                # Clear remarks if needed
+                if pd.notna(row.get('Remarks', '')) and str(row.get('Remarks', '')) != "":
+                    remarks_updates.append((index, ""))
             else:
-                rejected_count += 1
+                rejected_details.append({"name": name, "reason": rejection_reason})
+                remarks_updates.append((index, rejection_reason))
+
+        # Apply updates
+        for idx, remark in remarks_updates:
+            raw_df.at[idx, 'Remarks'] = remark
+
+        try:
+            raw_df.to_excel(DATA_FILE, index=False)
+        except Exception as e:
+            print(f"Failed to update products.xlsx: {e}")
 
         self.products_df = pd.DataFrame(valid_products)
 
@@ -318,8 +349,9 @@ class DataManager:
         self.startup_stats = {
             "total": len(valid_products),
             "new": len(current_products - previous_products),
-            "rejected": rejected_count,
-            "phased_out": len(previous_products - current_products)
+            "rejected": len(rejected_details),
+            "phased_out": len(previous_products - current_products),
+            "rejected_details": rejected_details
         }
         self.config["previous_products"] = list(seen_names)
         self.save_config()
@@ -971,12 +1003,9 @@ class POSSystem:
                 filtered = [item for item in all_values if value.lower() in item.lower()]
                 combo['values'] = filtered
 
-                # Optional: Force dropdown open if matches found (User preference dependent, can be omitted if annoying)
                 if filtered:
                     try:
-                        # Only open if not already open? Tkinter doesn't expose 'is_dropped_down' easily.
-                        # We just let user press Down arrow to see list.
-                        pass
+                        combo.event_generate('<Down>')
                     except:
                         pass
 
@@ -986,11 +1015,49 @@ class POSSystem:
     def show_startup_report(self):
         self.root.update()
         stats = self.data_manager.startup_stats
-        msg = (f"Business: {self.data_manager.business_name}\n"
-               f"Product Load Summary:\nTotal Loaded: {stats['total']}\n"
-               f"New Products: {stats['new']}\nRejected (Errors): {stats['rejected']}\n"
-               f"Phased-Out: {stats['phased_out']}")
-        messagebox.showinfo("Startup Report", msg)
+
+        if stats.get('rejected', 0) == 0:
+            msg = (f"Business: {self.data_manager.business_name}\n"
+                   f"Product Load Summary:\nTotal Loaded: {stats['total']}\n"
+                   f"New Products: {stats['new']}\nRejected (Errors): {stats['rejected']}\n"
+                   f"Phased-Out: {stats['phased_out']}")
+            messagebox.showinfo("Startup Report", msg)
+            return
+
+        # Custom Dialog for Rejections
+        win = tk.Toplevel(self.root)
+        win.title("Startup Report")
+        win.geometry("350x300")
+
+        ttk.Label(win, text=f"Business: {self.data_manager.business_name}", font=("Segoe UI", 11, "bold")).pack(pady=10)
+
+        f = ttk.Frame(win)
+        f.pack(pady=5, padx=20, fill="x")
+
+        ttk.Label(f, text=f"Total Loaded: {stats['total']}").pack(anchor="w")
+        ttk.Label(f, text=f"New Products: {stats['new']}").pack(anchor="w")
+        ttk.Label(f, text=f"Rejected (Errors): {stats['rejected']}", foreground="red", font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        ttk.Label(f, text=f"Phased-Out: {stats['phased_out']}").pack(anchor="w")
+
+        def show_rejected():
+            r_win = tk.Toplevel(win)
+            r_win.title("Rejected Products")
+            r_win.geometry("600x400")
+
+            tree = ttk.Treeview(r_win, columns=("name", "reason"), show="headings")
+            tree.heading("name", text="Product Name")
+            tree.heading("reason", text="Reason")
+            tree.column("name", width=350)
+            tree.column("reason", width=200)
+            tree.pack(fill="both", expand=True, padx=10, pady=10)
+
+            for item in stats.get('rejected_details', []):
+                tree.insert("", "end", values=(item['name'], item['reason']))
+
+            ttk.Button(r_win, text="Close", command=r_win.destroy).pack(pady=10)
+
+        ttk.Button(win, text="VIEW REJECTED PRODUCTS", command=show_rejected, style="Danger.TButton").pack(pady=15, ipadx=10)
+        ttk.Button(win, text="OK", command=win.destroy).pack(pady=5, ipadx=20)
 
     # --- INVENTORY TAB ---
     def setup_inventory_tab(self):
