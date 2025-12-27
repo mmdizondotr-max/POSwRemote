@@ -50,8 +50,8 @@ for folder in [RECEIPT_FOLDER, INVENTORY_FOLDER, SUMMARY_FOLDER, CORRECTION_FOLD
 
 # --- UTILS ---
 def truncate_product_name(name: str) -> str:
-    if len(name) > 25:
-        return name[:15] + name[-10:]
+    if len(name) > 30:
+        return name[:15] + name[-15:]
     return name
 
 # --- DEPENDENCY CONTAINER ---
@@ -238,16 +238,19 @@ class DataManager:
             return
 
         # --- Data Cleanup & Normalization ---
-        def clean_text(text_val):
+        def clean_text(text_val, is_product_name=False):
             if pd.isna(text_val): return ""
             s = str(text_val).upper()
             s = s.replace("'", "")       # Remove apostrophes
             s = s.replace("\n", " ")     # Single line
             s = re.sub(r'\s+', ' ', s)   # Remove double spaces
+            if is_product_name:
+                # Remove spaces between numbers and common units
+                s = re.sub(r'(\d+)\s+(MG|G|KG|ML|L|OZ|LB|CM|M|MM|PCS)\b', r'\1\2', s)
             return s.strip()
 
         if 'Product Name' in raw_df.columns:
-            raw_df['Product Name'] = raw_df['Product Name'].apply(clean_text)
+            raw_df['Product Name'] = raw_df['Product Name'].apply(lambda x: clean_text(x, is_product_name=True))
         if 'Product Category' in raw_df.columns:
             raw_df['Product Category'] = raw_df['Product Category'].apply(clean_text)
 
@@ -311,6 +314,26 @@ class DataManager:
 
         try:
             raw_df.to_excel(DATA_FILE, index=False)
+
+            # Post-processing: Apply Number Format
+            import openpyxl
+            wb = openpyxl.load_workbook(DATA_FILE)
+            ws = wb.active
+
+            # Find Price column index (1-based)
+            price_col_idx = None
+            for idx, cell in enumerate(ws[1], 1):
+                if cell.value and str(cell.value).strip() == "Price":
+                    price_col_idx = idx
+                    break
+
+            if price_col_idx:
+                for row in ws.iter_rows(min_row=2, min_col=price_col_idx, max_col=price_col_idx):
+                    for cell in row:
+                        cell.number_format = '0.00'
+
+            wb.save(DATA_FILE)
+
         except Exception as e:
             print(f"Failed to update products.xlsx: {e}")
 
