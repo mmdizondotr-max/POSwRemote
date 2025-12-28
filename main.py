@@ -369,6 +369,9 @@ class DataManager:
         except Exception as e:
             print(f"Failed to update products.xlsx: {e}")
 
+        # --- Smart Display Name Resolution ---
+        self.resolve_display_names(valid_products)
+
         self.products_df = pd.DataFrame(valid_products)
 
         # --- Product History Versioning ---
@@ -538,6 +541,65 @@ class DataManager:
     def get_stock_level(self, name: str) -> int:
         st = self.stock_cache.get(name, {'in': 0, 'out': 0})
         return st['in'] - st['out']
+
+    def resolve_display_names(self, product_list: List[Dict]) -> None:
+        """
+        Generates distinct display names for products to avoid ambiguity in dropdowns.
+        Updates 'product_list' in-place with a '_display_name' key.
+        """
+        # Group by initial 30-char truncation
+        groups = {}
+        for p in product_list:
+            name = p['Product Name']
+            trunc = truncate_product_name(name)
+            if trunc not in groups: groups[trunc] = []
+            groups[trunc].append(p)
+
+        # Limits to try for collision resolution
+        limits = [45, 60, 100, 200]
+
+        for key, group in groups.items():
+            if len(group) == 1:
+                p = group[0]
+                p['_display_name'] = key
+                self.name_lookup_cache[key] = p
+            else:
+                # Collision detected: Try to resolve by increasing limit
+                current_limit_idx = 0
+                resolved = False
+                current_group = group
+
+                while not resolved and current_limit_idx < len(limits):
+                    limit = limits[current_limit_idx]
+                    sub_groups = {}
+
+                    for p in current_group:
+                        full_name = p['Product Name']
+                        if len(full_name) > limit:
+                             half = limit // 2
+                             new_name = full_name[:half] + full_name[-half:]
+                        else:
+                             new_name = full_name
+
+                        if new_name not in sub_groups: sub_groups[new_name] = []
+                        sub_groups[new_name].append(p)
+
+                    max_collision_size = max(len(sg) for sg in sub_groups.values())
+                    if max_collision_size == 1:
+                        resolved = True
+                        for name_ver, items in sub_groups.items():
+                            p = items[0]
+                            p['_display_name'] = name_ver
+                            self.name_lookup_cache[name_ver] = p
+                    else:
+                        current_limit_idx += 1
+
+                if not resolved:
+                    # Fallback: Use full name if still colliding (should be distinct per validation)
+                    for p in current_group:
+                        full = p['Product Name']
+                        p['_display_name'] = full
+                        self.name_lookup_cache[full] = p
 
 # --- REPORT MANAGER ---
 class ReportManager:
@@ -1029,8 +1091,8 @@ class POSSystem:
         # Helper to get formatted "Name (Price)" list
         if self.data_manager.products_df.empty: return []
         sorted_df = self.data_manager.products_df.sort_values(by=["Product Name"])
-        # Use truncated name
-        return sorted_df.apply(lambda x: f"{truncate_product_name(x['Product Name'])} ({x['Price']:.2f})", axis=1).tolist()
+        # Use Smart Display Name if available, else fallback
+        return sorted_df.apply(lambda x: f"{x.get('_display_name', truncate_product_name(x['Product Name']))} ({x['Price']:.2f})", axis=1).tolist()
 
     def setup_searchable_combobox(self, combo):
         """Enables typing to filter the combobox values."""
