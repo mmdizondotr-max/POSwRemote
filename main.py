@@ -249,8 +249,18 @@ class DataManager:
                 s = re.sub(r'(\d+)\s+(MG|G|KG|ML|L|OZ|LB|CM|M|MM|PCS)\b', r'\1\2', s)
             return s.strip()
 
+        cleaned_count = 0
         if 'Product Name' in raw_df.columns:
-            raw_df['Product Name'] = raw_df['Product Name'].apply(lambda x: clean_text(x, is_product_name=True))
+            def clean_and_count(x):
+                nonlocal cleaned_count
+                orig = str(x)
+                new = clean_text(x, is_product_name=True)
+                # Count if effectively changed (ignoring NaN vs "" diff if original was nan)
+                if pd.notna(x) and orig != new:
+                    cleaned_count += 1
+                return new
+            raw_df['Product Name'] = raw_df['Product Name'].apply(clean_and_count)
+
         if 'Product Category' in raw_df.columns:
             raw_df['Product Category'] = raw_df['Product Category'].apply(clean_text)
 
@@ -267,7 +277,10 @@ class DataManager:
         valid_products = []
         seen_names = set()
         rejected_details = []
-        remarks_updates = []
+
+        # Temporary lists for sorting
+        valid_rows_list = []
+        error_rows_list = []
 
         for index, row in raw_df.iterrows():
             cat = str(row.get('Product Category', ''))
@@ -285,6 +298,9 @@ class DataManager:
             elif not name or name == 'NAN': rejection_reason = "Invalid Name"
             elif name in seen_names: rejection_reason = "Duplicate Name"
 
+            # Construct row dict for reconstruction
+            row_dict = row.to_dict()
+
             if rejection_reason is None:
                 seen_names.add(name)
                 b_name = str(row.get('Business Name', self.business_name))
@@ -301,18 +317,34 @@ class DataManager:
                 truncated = truncate_product_name(name)
                 self.name_lookup_cache[truncated] = entry
 
-                # Clear remarks if needed
-                if pd.notna(row.get('Remarks', '')) and str(row.get('Remarks', '')) != "":
-                    remarks_updates.append((index, ""))
+                # Clear remarks
+                row_dict['Remarks'] = ""
+                valid_rows_list.append(row_dict)
             else:
                 rejected_details.append({"name": name, "reason": rejection_reason})
-                remarks_updates.append((index, rejection_reason))
+                row_dict['Remarks'] = rejection_reason
+                error_rows_list.append(row_dict)
 
-        # Apply updates
-        for idx, remark in remarks_updates:
-            raw_df.at[idx, 'Remarks'] = remark
+        # Sort Logic: Errors first, then valid. Both sorted by Category -> Name
+        def sort_helper(r):
+            return (str(r.get('Product Category', '')), str(r.get('Product Name', '')))
+
+        error_rows_list.sort(key=sort_helper)
+        valid_rows_list.sort(key=sort_helper)
+
+        final_rows = error_rows_list + valid_rows_list
+        raw_df = pd.DataFrame(final_rows)
 
         try:
+            # Ensure column order matches standard
+            if not raw_df.empty:
+                cols = ["Business Name", "Product Category", "Product Name", "Price", "Remarks"]
+                # Keep other columns if they exist
+                existing_cols = [c for c in raw_df.columns if c not in cols]
+                final_cols = cols + existing_cols
+                # Reindex safely
+                raw_df = raw_df.reindex(columns=final_cols)
+
             raw_df.to_excel(DATA_FILE, index=False)
 
             # Post-processing: Apply Number Format
@@ -374,7 +406,8 @@ class DataManager:
             "new": len(current_products - previous_products),
             "rejected": len(rejected_details),
             "phased_out": len(previous_products - current_products),
-            "rejected_details": rejected_details
+            "rejected_details": rejected_details,
+            "cleaned_names": cleaned_count
         }
         self.config["previous_products"] = list(seen_names)
         self.save_config()
@@ -1036,7 +1069,9 @@ class POSSystem:
         if stats.get('rejected', 0) == 0:
             msg = (f"Business: {self.data_manager.business_name}\n"
                    f"Product Load Summary:\nTotal Loaded: {stats['total']}\n"
-                   f"New Products: {stats['new']}\nRejected (Errors): {stats['rejected']}\n"
+                   f"New Products: {stats['new']}\n"
+                   f"Cleaned Names: {stats.get('cleaned_names', 0)}\n"
+                   f"Rejected (Errors): {stats['rejected']}\n"
                    f"Phased-Out: {stats['phased_out']}")
             messagebox.showinfo("Startup Report", msg)
             return
@@ -1053,6 +1088,7 @@ class POSSystem:
 
         ttk.Label(f, text=f"Total Loaded: {stats['total']}").pack(anchor="w")
         ttk.Label(f, text=f"New Products: {stats['new']}").pack(anchor="w")
+        ttk.Label(f, text=f"Cleaned Names: {stats.get('cleaned_names', 0)}").pack(anchor="w")
         ttk.Label(f, text=f"Rejected (Errors): {stats['rejected']}", foreground="red", font=("Segoe UI", 9, "bold")).pack(anchor="w")
         ttk.Label(f, text=f"Phased-Out: {stats['phased_out']}").pack(anchor="w")
 
@@ -2457,14 +2493,16 @@ class POSSystem:
         for name in cached_names:
             if name not in known_names:
                 qty = self.data_manager.get_stock_level(name)
-                if qty != 0:
-                    items.append({
-                        "name": f"{name} (Old)",
-                        "category": "Phased Out",
-                        "qty": qty,
-                        "price": 0,
-                        "subtotal": 0
-                    })
+                items.append({
+                    "name": f"{name} (Old)",
+                    "category": "Phased Out",
+                    "qty": qty,
+                    "price": 0,
+                    "subtotal": 0
+                })
+
+        # FILTER: Show only items with POSITIVE stock (qty > 0)
+        items = [i for i in items if i['qty'] > 0]
 
         fname = f"BI-{today.strftime('%Y%m%d')}.pdf"
         full_path = os.path.join(SUMMARY_FOLDER, fname)

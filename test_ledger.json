@@ -1,0 +1,42 @@
+{
+  "transactions": [],
+  "summary_count": 0,
+  "shortcuts_asked": false,
+  "product_history": [
+    {
+      "timestamp": "2025-12-28 01:43:10",
+      "items": [
+        {
+          "Business Name": "Biz",
+          "Product Category": "GENERAL",
+          "Product Name": "ZEBRA",
+          "Price": 10.0
+        },
+        {
+          "Business Name": "Biz",
+          "Product Category": "GENERAL",
+          "Product Name": "APPLE",
+          "Price": 10.0
+        },
+        {
+          "Business Name": "Biz",
+          "Product Category": "GENERAL",
+          "Product Name": "DIRTY 500MG",
+          "Price": 10.0
+        },
+        {
+          "Business Name": "Biz",
+          "Product Category": "PHARMACY",
+          "Product Name": "ASPIRIN",
+          "Price": 5.0
+        },
+        {
+          "Business Name": "Biz",
+          "Product Category": "GENERAL",
+          "Product Name": "DUPLICATE",
+          "Price": 10.0
+        }
+      ]
+    }
+  ]
+}
