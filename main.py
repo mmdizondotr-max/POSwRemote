@@ -111,6 +111,7 @@ class DataManager:
         # Caches
         self.stock_cache: Dict[str, Dict] = {}
         self.name_lookup_cache: Dict[str, Dict] = {}
+        self.display_name_map: Dict[str, str] = {}  # Full Name -> Smart Display Name
         self.config: Dict = {}
 
         self.load_config()
@@ -267,12 +268,26 @@ class DataManager:
         if 'Remarks' not in raw_df.columns:
             raw_df['Remarks'] = ""
 
-        # Business Name Logic
-        if "Business Name" in raw_df.columns and not raw_df.empty:
-            val = str(raw_df.iloc[0]["Business Name"]).strip()
-            if val and val.lower() != "nan":
-                self.business_name = val
-                self.config["cached_business_name"] = val
+        # Business Name Logic & Cleanup
+        if "Business Name" in raw_df.columns:
+            # Find first non-empty value
+            first_val = "My Business"
+            found_idx = -1
+
+            # Search for first valid string
+            for idx, val in enumerate(raw_df["Business Name"]):
+                s_val = str(val).strip()
+                if s_val and s_val.lower() != "nan":
+                    first_val = s_val
+                    found_idx = idx
+                    break
+
+            # If nothing found, try config or keep default
+            if found_idx == -1:
+                first_val = self.config.get("cached_business_name", "My Business")
+
+            self.business_name = first_val
+            self.config["cached_business_name"] = first_val
 
         valid_products = []
         seen_names = set()
@@ -303,7 +318,14 @@ class DataManager:
 
             if rejection_reason is None:
                 seen_names.add(name)
-                b_name = str(row.get('Business Name', self.business_name))
+
+                # Ensure Business Name is populated in memory even if empty in file row
+                raw_b_name = str(row.get('Business Name', ''))
+                if not raw_b_name or raw_b_name.lower() == 'nan':
+                    b_name = self.business_name
+                else:
+                    b_name = raw_b_name
+
                 entry = {
                     "Business Name": b_name,
                     "Product Category": cat,
@@ -345,6 +367,13 @@ class DataManager:
                 # Reindex safely
                 raw_df = raw_df.reindex(columns=final_cols)
 
+            # --- Business Name Cleanup (Visual in File) ---
+            # Ensure only the first row (A2) has the business name, others empty.
+            if "Business Name" in raw_df.columns:
+                raw_df["Business Name"] = ""
+                if not raw_df.empty:
+                    raw_df.at[0, "Business Name"] = self.business_name
+
             raw_df.to_excel(DATA_FILE, index=False)
 
             # Post-processing: Apply Number Format
@@ -371,6 +400,12 @@ class DataManager:
 
         # --- Smart Display Name Resolution ---
         self.resolve_display_names(valid_products)
+
+        # Populate Display Name Map (Full Name -> Smart Name)
+        self.display_name_map = {}
+        for p in valid_products:
+            if '_display_name' in p:
+                self.display_name_map[p['Product Name']] = p['_display_name']
 
         self.products_df = pd.DataFrame(valid_products)
 
@@ -606,10 +641,11 @@ class ReportManager:
     """
     Handles PDF generation.
     """
-    def __init__(self, modules: AppModules, business_name: str, session_user: str):
+    def __init__(self, modules: AppModules, business_name: str, session_user: str, data_manager: Optional[DataManager] = None):
         self.mod = modules
         self.business_name = business_name
         self.session_user = session_user
+        self.data_manager = data_manager
 
     def generate_grouped_pdf(self, filepath: str, title: str, date_str: str, items: List[Dict],
                              col_headers: List[str], col_pos: List[float], is_summary: bool = False,
@@ -701,29 +737,41 @@ class ReportManager:
                 row_vals = []
                 row_txt = []
 
+                # Resolve Name
+                raw_name = item.get('name', 'Unknown')
+                display_name = raw_name
+
+                # Smart Name Lookup
+                if self.data_manager and raw_name in self.data_manager.display_name_map:
+                    display_name = self.data_manager.display_name_map[raw_name]
+
+                # Safety Truncation (40 chars max)
+                if len(display_name) > 40:
+                    display_name = display_name[:20] + "..." + display_name[-17:]
+
                 # Determine Row Data based on context
                 if is_bi:
-                    row_txt = [item['name'][:45], str(int(item['qty']))]
+                    row_txt = [display_name, str(int(item['qty']))]
                     row_vals = [0, item['qty']]
                 elif is_summary:
                     price_txt = f"{item['price']:.2f}" if item['price'] > 0 else "-"
-                    row_txt = [item['name'][:35], price_txt, str(int(item['in'])),
+                    row_txt = [display_name, price_txt, str(int(item['in'])),
                                str(int(item['out'])), str(int(item['remaining'])), f"{item['sales']:.2f}"]
                     row_vals = [0, 0, item['in'], item['out'], item['remaining'], item['sales']]
                 elif "subtotal" in item:
-                    row_txt = [item['name'][:35], f"{item['price']:.2f}", str(int(item['qty'])),
+                    row_txt = [display_name, f"{item['price']:.2f}", str(int(item['qty'])),
                                f"{item['subtotal']:.2f}"]
                     row_vals = [0, 0, item['qty'], item['subtotal']]
                 elif "new_stock" in item:
-                    row_txt = [item['name'][:35], f"{item.get('price', 0):.2f}", f"{int(item['qty'])}",
+                    row_txt = [display_name, f"{item.get('price', 0):.2f}", f"{int(item['qty'])}",
                                str(int(item.get('new_stock', 0)))]
                     row_vals = [0, 0, item['qty'], 0]
                 elif "qty_final" in item:
-                    row_txt = [item['name'][:35], str(int(item['qty_orig'])), f"{int(item['qty']):+}",
+                    row_txt = [display_name, str(int(item['qty_orig'])), f"{int(item['qty']):+}",
                                str(int(item['qty_final']))]
                     row_vals = [0, 0, item['qty'], 0]
                 else:
-                    row_txt = [item['name'][:35], f"{item.get('price', 0):.2f}", f"{int(item['qty'])}"]
+                    row_txt = [display_name, f"{item.get('price', 0):.2f}", f"{int(item['qty'])}"]
                     row_vals = [0, 0, item['qty']]
 
                 for i, txt in enumerate(row_txt):
@@ -1019,7 +1067,7 @@ class POSSystem:
         self.data_manager = DataManager(self.mod)
         self.touch_mode = self.data_manager.config.get("touch_mode", False)
 
-        self.report_manager = ReportManager(self.mod, self.data_manager.business_name, self.session_user)
+        self.report_manager = ReportManager(self.mod, self.data_manager.business_name, self.session_user, self.data_manager)
         self.email_manager = EmailManager(self.mod)
 
         # Carts & UI State
