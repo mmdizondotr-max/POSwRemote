@@ -113,6 +113,7 @@ class DataManager:
         self.name_lookup_cache: Dict[str, Dict] = {}
         self.display_name_map: Dict[str, str] = {}  # Full Name -> Smart Display Name
         self.config: Dict = {}
+        self.date_fmt = "%Y-%m-%d %H:%M:%S"
 
         self.load_config()
         self.create_rolling_backup()
@@ -484,9 +485,6 @@ class DataManager:
         out_count = 0
         corrections_in_period = []
 
-        # Optimization: cache the date format string
-        date_fmt = "%Y-%m-%d %H:%M:%S"
-
         for transaction in self.ledger:
             try:
                 # Type Check
@@ -497,7 +495,7 @@ class DataManager:
                 if period_filter:
                     ts_str = transaction.get('timestamp')
                     try:
-                        dt = datetime.datetime.strptime(ts_str, date_fmt)
+                        dt = datetime.datetime.strptime(ts_str, self.date_fmt)
                     except:
                         dt = datetime.datetime.now()
 
