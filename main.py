@@ -107,6 +107,7 @@ class DataManager:
         self.shortcuts_asked: bool = False
         self.business_name: str = "My Business"
         self.startup_stats: Dict = {}
+        self._ledger_lock = threading.Lock()
 
         # Caches
         self.stock_cache: Dict[str, Dict] = {}
@@ -171,18 +172,26 @@ class DataManager:
         # For <10k records, on-demand parsing in calculate_stats is usually fine, but let's be careful.
 
     def create_rolling_backup(self) -> None:
-        """Creates a rolling backup of the ledger file."""
+        """Creates a rolling backup of the ledger file in a background thread."""
         if not os.path.exists(LEDGER_FILE):
             return
 
+        thread = threading.Thread(target=self._perform_backup, daemon=True)
+        thread.start()
+
+    def _perform_backup(self):
+        """The actual backup logic to be run in a thread."""
         try:
-            timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-            backup_name = f"ledger_backup_{timestamp}.json"
-            backup_path = os.path.join(BACKUP_DIR, backup_name)
+            with self._ledger_lock:
+                if not os.path.exists(LEDGER_FILE):
+                    return
 
-            shutil.copy2(LEDGER_FILE, backup_path)
+                timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                backup_name = f"ledger_backup_{timestamp}.json"
+                backup_path = os.path.join(BACKUP_DIR, backup_name)
+                shutil.copy2(LEDGER_FILE, backup_path)
 
-            # Cleanup old backups (Keep 10 most recent)
+            # Cleanup can happen outside the lock
             backups = [
                 os.path.join(BACKUP_DIR, f)
                 for f in os.listdir(BACKUP_DIR)
@@ -205,14 +214,14 @@ class DataManager:
                 "product_history": self.product_history
             }
 
-            # Atomic Write
-            temp_file = LEDGER_FILE + ".tmp"
-            with open(temp_file, 'w') as f:
-                json.dump(data, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-
-            os.replace(temp_file, LEDGER_FILE)
+            with self._ledger_lock:
+                # Atomic Write
+                temp_file = LEDGER_FILE + ".tmp"
+                with open(temp_file, 'w') as f:
+                    json.dump(data, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temp_file, LEDGER_FILE)
 
         except Exception as e:
             messagebox.showerror("Save Error", f"Could not save database: {e}")
