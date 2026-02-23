@@ -1947,6 +1947,7 @@ class POSSystem:
 
         ttk.Separator(f, orient='horizontal').pack(fill='x', pady=10)
         ttk.Button(f, text="Load Test (Dev)", command=self.run_load_test, style="Danger.TButton").pack(anchor="w", pady=5)
+        ttk.Button(f, text="Delete All Data", command=self.delete_all_data, style="Danger.TButton").pack(anchor="w", pady=5)
 
         # Web Server Panel
         self.setup_web_server_panel(self.tab_settings_web)
@@ -2281,6 +2282,37 @@ class POSSystem:
 
         except Exception as e:
             messagebox.showerror("Load Test Error", f"Simulation failed: {e}")
+
+    def delete_all_data(self):
+        confirm = messagebox.askyesno("Delete All Data", "Are you sure you want to delete all transaction data? This action cannot be undone and will permanently erase all receipts, inventory history, and sales data.", icon='warning')
+        if not confirm:
+            return
+
+        confirm2 = simpledialog.askstring("Confirm Deletion", "Type 'DELETE' to confirm deletion of all data:")
+        if confirm2 != "DELETE":
+            messagebox.showinfo("Cancelled", "Data deletion cancelled.")
+            return
+
+        try:
+            # Clear ledger
+            self.data_manager.ledger.clear()
+            self.data_manager.product_history.clear()
+            self.data_manager.summary_count = 0
+            self.data_manager.save_ledger()
+
+            for folder in [RECEIPT_FOLDER, INVENTORY_FOLDER, SUMMARY_FOLDER, CORRECTION_FOLDER]:
+                if os.path.exists(folder):
+                    shutil.rmtree(folder)
+                    os.makedirs(folder)
+
+            self.data_manager.refresh_stock_cache()
+            self.refresh_inv()
+            self.refresh_pos()
+            self.refresh_correction_list()
+
+            messagebox.showinfo("Success", "All data has been successfully deleted.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to delete all data: {e}")
 
     # --- WEB SERVER GUI HELPERS ---
     def setup_web_server_panel(self, parent_frame):
