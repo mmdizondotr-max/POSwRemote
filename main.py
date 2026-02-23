@@ -35,7 +35,7 @@ CORRECTION_FOLDER = "correctionreceipts"
 DATA_FILE = "products.xlsx"
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
 LEDGER_FILE = os.path.join(APP_DATA_DIR, "ledger.json")
-APP_TITLE = "MMD Inventory Tracker v15.1"  # Refactored Version
+APP_TITLE = "MMD Inventory Tracker v15.2"  # Refactored Version
 
 # --- EMAIL CONFIGURATION ---
 SMTP_SERVER = "smtp.gmail.com"
@@ -1944,6 +1944,7 @@ class POSSystem:
         mf.pack(anchor="w", pady=5)
         ttk.Button(mf, text="Harmonize Receipts", command=lambda: self.harmonize_receipts(silent=False)).pack(side="left", padx=5)
         ttk.Button(mf, text="Restore Products File", command=self.regenerate_products_file).pack(side="left", padx=5)
+        ttk.Button(mf, text="Smart Cleanup", command=self.smart_cleanup).pack(side="left", padx=5)
 
         ttk.Separator(f, orient='horizontal').pack(fill='x', pady=10)
         ttk.Button(f, text="Load Test (Dev)", command=self.run_load_test, style="Danger.TButton").pack(anchor="w", pady=5)
@@ -2313,6 +2314,190 @@ class POSSystem:
             messagebox.showinfo("Success", "All data has been successfully deleted.")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to delete all data: {e}")
+
+    def smart_cleanup(self):
+        # 1. Rules Engine
+        def generate_smart_name(old_name: str) -> str:
+            name = old_name.upper()
+            
+            # Typos
+            name = name.replace("REALXING", "RELAXING")
+            
+            # Abbreviations
+            name = re.sub(r'\bSYR\b', 'SYRUP', name)
+            name = re.sub(r'\bTAB\b', 'TABLET', name)
+            name = re.sub(r'\bCAP\b', 'CAPSULE', name)
+            name = re.sub(r'\bSUSP\b', 'SUSPENSION', name)
+            name = re.sub(r'\bCR\b', 'CREAM', name)
+            name = re.sub(r'\bCRM\b', 'CREAM', name)
+            name = re.sub(r'\bEXT\b', 'EXTRA', name)
+            name = re.sub(r'\bOINT\b', 'OINTMENT', name)
+            name = re.sub(r'\bLIQ\b', 'LIQUID', name)
+            name = re.sub(r'\bDRP\b', 'DROPS', name)
+            
+            # Unit standardizations
+            name = re.sub(r'(\d+)\s*GMS\b', r'\1G', name)
+            name = re.sub(r'(\d+)\s*GM\b', r'\1G', name)
+            name = re.sub(r'\bLITER\b', '1L', name)
+            
+            # Pack sizes
+            name = re.sub(r'\b(\d+)S\b', r"\1'S", name)
+            name = re.sub(r'\bX(\d+)\b', r" \1'S", name) 
+            name = re.sub(r'\bX\s*(\d+)S\b', r"\1'S", name)
+            name = re.sub(r'\bX\s*(\d+)\b', r"\1'S", name)
+            
+            # Remove noise
+            noise_words = [r'20%\s*OFF', r'\(9\+1\)', r'PROMO\s*PACK', r'VALUEPACK', r'PROMOPACK', r'BIG', r'SML', r'SMALL', r'MED']
+            for noise in noise_words:
+                name = re.sub(noise, '', name)
+                
+            # Clean multiple spaces again
+            name = re.sub(r'\s+', ' ', name).strip()
+            # Remove trailing dash/space
+            name = re.sub(r'[- ]+$', '', name)
+            return name
+
+        try:
+            raw_df = self.mod.pd.read_excel(DATA_FILE)
+            if 'Product Name' not in raw_df.columns:
+                return
+        except Exception:
+            return
+
+        names = raw_df['Product Name'].dropna().unique().tolist()
+        proposals = []
+        for old in names:
+            old_str = str(old)
+            new_str = generate_smart_name(old_str)
+            if old_str != new_str:
+                proposals.append((old_str, new_str))
+                
+        if not proposals:
+            messagebox.showinfo("Smart Cleanup", "No product names require renaming.")
+            return
+
+        # 2. Review Screen UI
+        win = tk.Toplevel(self.root)
+        win.title("Smart Rename Products")
+        win.geometry("800x600")
+        win.grab_set()
+
+        ttk.Label(win, text="Review suggested product name changes. Selected items will have their stock and history merged.", font=("Segoe UI", 10)).pack(pady=10)
+
+        columns = ("Status", "Old Name", "New Name")
+        tree = ttk.Treeview(win, columns=columns, show="headings", height=20)
+        tree.heading("Status", text="Status")
+        tree.heading("Old Name", text="Current Name")
+        tree.heading("New Name", text="Proposed Name")
+        tree.column("Status", width=50, anchor="center")
+        tree.column("Old Name", width=350)
+        tree.column("New Name", width=350)
+        tree.pack(fill="both", expand=True, padx=10, pady=5)
+
+        # Style treeview rows
+        tree.tag_configure("checked", background="#d4edda")
+        tree.tag_configure("unchecked", background="#f8d7da")
+
+        for old, new in proposals:
+            tree.insert("", "end", values=("[✓]", old, new), tags=("checked",))
+            
+        def toggle_row(event):
+            item_id = tree.identify_row(event.y)
+            if item_id:
+                vals = list(tree.item(item_id, "values"))
+                if vals[0] == "[✓]":
+                    vals[0] = "[ ]"
+                    tree.item(item_id, values=vals, tags=("unchecked",))
+                else:
+                    vals[0] = "[✓]"
+                    tree.item(item_id, values=vals, tags=("checked",))
+
+        tree.bind("<Double-1>", toggle_row)
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(pady=10)
+
+        def select_all():
+            for item_id in tree.get_children():
+                vals = list(tree.item(item_id, "values"))
+                vals[0] = "[✓]"
+                tree.item(item_id, values=vals, tags=("checked",))
+
+        def deselect_all():
+            for item_id in tree.get_children():
+                vals = list(tree.item(item_id, "values"))
+                vals[0] = "[ ]"
+                tree.item(item_id, values=vals, tags=("unchecked",))
+
+        def apply_changes():
+            to_rename = {}
+            for item_id in tree.get_children():
+                vals = tree.item(item_id, "values")
+                if vals[0] == "[✓]":
+                    to_rename[vals[1]] = vals[2]
+
+            if not to_rename:
+                messagebox.showinfo("No Selection", "No items selected to rename.", parent=win)
+                return
+
+            confirm = simpledialog.askstring("Confirm", "Type 'CONFIRM' to finalize smart rename changes:", parent=win)
+            if confirm != "CONFIRM":
+                messagebox.showinfo("Cancelled", "Smart rename cancelled.", parent=win)
+                return
+
+            try:
+                # 3. Update products.xlsx
+                df = self.mod.pd.read_excel(DATA_FILE)
+                if 'Product Name' in df.columns:
+                    df['Product Name'] = df['Product Name'].apply(lambda x: to_rename.get(str(x), str(x)))
+                
+                # Deduplicate by saving - wait, load_products will deduplicate automatically. We just rewrite the Excel.
+                df.to_excel(DATA_FILE, index=False)
+
+                # 4. Update ledger history mapping
+                with self.data_manager._ledger_lock:
+                    for tx in self.data_manager.ledger:
+                        for item in tx.get('items', []):
+                            op_name = item.get('name')
+                            if op_name in to_rename:
+                                item['name'] = to_rename[op_name]
+                    
+                    for hist in self.data_manager.product_history:
+                        for p in hist.get('items', []):
+                            ph_name = p.get('Product Name')
+                            if ph_name in to_rename:
+                                p['Product Name'] = to_rename[ph_name]
+                                
+                    # Write out ledger
+                    temp_file = LEDGER_FILE + ".tmp"
+                    data = {
+                        "transactions": self.data_manager.ledger,
+                        "summary_count": self.data_manager.summary_count,
+                        "shortcuts_asked": self.data_manager.shortcuts_asked,
+                        "product_history": self.data_manager.product_history
+                    }
+                    with open(temp_file, 'w') as f:
+                        json.dump(data, f, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(temp_file, LEDGER_FILE)
+
+                # 5. Reload Everything
+                self.data_manager.load_products()
+                self.data_manager.refresh_stock_cache()
+
+                self.refresh_inv()
+                self.refresh_pos()
+                self.refresh_correction_list()
+
+                messagebox.showinfo("Success", f"Renamed {len(to_rename)} products successfully.", parent=win)
+                win.destroy()
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to rename products: {e}", parent=win)
+
+        ttk.Button(btn_frame, text="Select All", command=select_all).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Deselect All", command=deselect_all).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Approve & Rename", command=apply_changes, style="Accent.TButton").pack(side="left", padx=5)
 
     # --- WEB SERVER GUI HELPERS ---
     def setup_web_server_panel(self, parent_frame):
