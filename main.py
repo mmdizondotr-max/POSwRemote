@@ -16,7 +16,7 @@ from typing import Optional, List, Dict, Any, Tuple, Union, Set
 from PIL import Image, ImageTk
 from style_manager import StyleManager
 
-# pyinstaller --onefile --noconsole --splash splash_image2.png main.py
+# pyinstaller --onefile --noconsole --splash splash_image3.png main.py
 
 # --- CONFIGURATION CONSTANTS ---
 APP_DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MMD_POS_System")
@@ -35,7 +35,7 @@ CORRECTION_FOLDER = "correctionreceipts"
 DATA_FILE = "products.xlsx"
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
 LEDGER_FILE = os.path.join(APP_DATA_DIR, "ledger.json")
-APP_TITLE = "MMD Inventory Tracker v15.0"  # Refactored Version
+APP_TITLE = "MMD Inventory Tracker v15.1"  # Refactored Version
 
 # --- EMAIL CONFIGURATION ---
 SMTP_SERVER = "smtp.gmail.com"
