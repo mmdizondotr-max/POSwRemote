@@ -19,7 +19,7 @@ from style_manager import StyleManager
 # pyinstaller --onefile --noconsole --splash splash_image3.png main.py
 
 # --- CONFIGURATION CONSTANTS ---
-GEMINI_API_KEY = "AIzaSyD5WQKzdiJrHutnI0kA1z8TAli9GXmSi4M" # Replace with your Gemini API Key here if you want Smart Cleanup to use AI.
+GEMINI_API_KEY = "" # Replace with your Gemini API Key here if you want Smart Cleanup to use AI.
 
 APP_DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MMD_POS_System")
 BACKUP_DIR = os.path.join(APP_DATA_DIR, "backups")
