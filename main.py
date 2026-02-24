@@ -19,6 +19,8 @@ from style_manager import StyleManager
 # pyinstaller --onefile --noconsole --splash splash_image3.png main.py
 
 # --- CONFIGURATION CONSTANTS ---
+GEMINI_API_KEY = "AIzaSyD5WQKzdiJrHutnI0kA1z8TAli9GXmSi4M" # Replace with your Gemini API Key here if you want Smart Cleanup to use AI.
+
 APP_DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MMD_POS_System")
 BACKUP_DIR = os.path.join(APP_DATA_DIR, "backups")
 
@@ -35,7 +37,7 @@ CORRECTION_FOLDER = "correctionreceipts"
 DATA_FILE = "products.xlsx"
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
 LEDGER_FILE = os.path.join(APP_DATA_DIR, "ledger.json")
-APP_TITLE = "MMD Inventory Tracker v15.2"  # Refactored Version
+APP_TITLE = "MMD Inventory Tracker v15.3"  # Refactored Version
 
 # --- EMAIL CONFIGURATION ---
 SMTP_SERVER = "smtp.gmail.com"
@@ -2365,12 +2367,96 @@ class POSSystem:
             return
 
         names = raw_df['Product Name'].dropna().unique().tolist()
+        
+        # --- GEMINI INTEGRATION ---
+        use_gemini = False
         proposals = []
-        for old in names:
-            old_str = str(old)
-            new_str = generate_smart_name(old_str)
-            if old_str != new_str:
-                proposals.append((old_str, new_str))
+        if GEMINI_API_KEY:
+            try:
+                import google.generativeai as genai
+                # Check online status implicitly by trying to configure and call
+                genai.configure(api_key=GEMINI_API_KEY)
+                # Ensure the key is valid by fetching models
+                list(genai.list_models())
+                use_gemini = True
+            except Exception as e:
+                print(f"Gemini initialization failed, falling back to regex: {e}")
+                use_gemini = False
+
+        if use_gemini:
+            # Show a processing dialog since Gemini might take a moment
+            proc_win = tk.Toplevel(self.root)
+            proc_win.title("Processing")
+            proc_win.geometry("300x100")
+            proc_win.grab_set()
+            ttk.Label(proc_win, text="Processing names with Gemini AI...\nPlease wait.", justify="center").pack(expand=True)
+            self.root.update()
+
+            try:
+                import google.generativeai as genai
+                model = genai.GenerativeModel("gemini-1.5-flash")
+                
+                # Batch processing to avoid hitting limits or huge prompts
+                batch_size = 50
+                for i in range(0, len(names), batch_size):
+                    batch_names = names[i:i + batch_size]
+                    
+                    prompt = f"""
+                    You are an expert pharmacist and inventory manager. I will provide you with a JSON array of messy product names from a pharmacy and convenience store point of sale system. 
+                    Your task is to standardize these names to make them easily searchable and clean.
+                    
+                    Rules:
+                    1. Expand confusing abbreviations (e.g. SYR -> SYRUP, TAB -> TABLET, OINT -> OINTMENT, CAP -> CAPSULE).
+                    2. Maintain clear brand names (e.g. 'JB' should likely be 'JOHNSONS BABY' or remain if unsure).
+                    3. Normalize units and pack sizes (e.g. '15GM' -> '15G', 'X24S' -> \"24'S\", 'LITER' -> '1L').
+                    4. Remove promotional text like '20% OFF', 'PROMO PACK', 'VALUEPACK', '(9+1)'.
+                    5. Order logically, e.g. [Brand] [Product] [Variant] [Size].
+                    6. DO NOT combine variants (e.g. keep Orange and Strawberry separate).
+                    7. Do not change the name drastically if you are unsure.
+                    
+                    Input Names:
+                    {json.dumps(batch_names)}
+                    
+                    Return ONLY a valid JSON object mapping the exact ORIGINAL name string to the NEW standardized name string. No markdown formatting, just raw JSON.
+                    """
+                    
+                    response = model.generate_content(prompt)
+                    try:
+                        # Clean up response to ensure it's valid JSON (sometimes it wraps in ```json ... ```)
+                        resp_text = response.text.replace("```json", "").replace("```", "").strip()
+                        ai_mapping = json.loads(resp_text)
+                        
+                        for old, new in ai_mapping.items():
+                            if old in batch_names and str(old) != str(new):
+                                proposals.append((str(old), str(new)))
+                    except Exception as e:
+                        print(f"Failed to parse Gemini batch {i}: {e}")
+                        print(f"Raw output: {response.text}")
+                        # Fallback for this batch if it fails
+                        for old in batch_names:
+                            old_str = str(old)
+                            new_str = generate_smart_name(old_str)
+                            if old_str != new_str:
+                                proposals.append((old_str, new_str))
+            except Exception as e:
+                print(f"Gemini API failure during processing: {e}")
+                messagebox.showerror("AI Error", "Failed to connect to Gemini AI. Falling back to offline rule engine.", parent=proc_win)
+                # Fallback to local regex for remaining
+                for old in names:
+                    if not any(old == p[0] for p in proposals): # Don't redo ones already caught
+                        old_str = str(old)
+                        new_str = generate_smart_name(old_str)
+                        if old_str != new_str:
+                            proposals.append((old_str, new_str))
+            finally:
+                proc_win.destroy()
+        else:
+            # Offline / Regex Mode
+            for old in names:
+                old_str = str(old)
+                new_str = generate_smart_name(old_str)
+                if old_str != new_str:
+                    proposals.append((old_str, new_str))
                 
         if not proposals:
             messagebox.showinfo("Smart Cleanup", "No product names require renaming.")
