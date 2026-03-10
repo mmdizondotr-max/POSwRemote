@@ -37,7 +37,7 @@ CORRECTION_FOLDER = "correctionreceipts"
 DATA_FILE = "products.xlsx"
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
 LEDGER_FILE = os.path.join(APP_DATA_DIR, "ledger.json")
-APP_TITLE = "MMD Inventory Tracker v15.3"  # Refactored Version
+APP_TITLE = "MMD Inventory Tracker v16.0"  # Refactored Version
 
 # --- EMAIL CONFIGURATION ---
 SMTP_SERVER = "smtp.gmail.com"
@@ -107,8 +107,10 @@ class DataManager:
         self.product_history: List[Dict] = []
         self.summary_count: int = 0
         self.shortcuts_asked: bool = False
-        self.business_name: str = "My Business"
+        self.business_name = "iMD Pharmacy"
         self.startup_stats: Dict = {}
+        self.offline_receipts: List[Dict] = []
+        self.last_bi_date: str = ""
         self._ledger_lock = threading.Lock()
 
         # Caches
@@ -128,7 +130,7 @@ class DataManager:
         default = {
             "startup": False,
             "splash_img": "",
-            "cached_business_name": "My Business",
+            "cached_business_name": "iMD Pharmacy",
             "previous_products": [],
             "recipient_email": "",
             "last_bi_date": "",
@@ -161,14 +163,18 @@ class DataManager:
                         self.summary_count = 0
                         self.shortcuts_asked = False
                         self.product_history = []
+                        self.offline_receipts = []
                     elif isinstance(data, dict):
                         self.ledger = data.get("transactions", [])
                         self.summary_count = data.get("summary_count", 0)
                         self.shortcuts_asked = data.get("shortcuts_asked", False)
                         self.product_history = data.get("product_history", [])
+                        self.offline_receipts = data.get("offline_receipts", [])
+                        self.last_bi_date = data.get("last_bi_date", "")
             except:
                 self.ledger = []
                 self.product_history = []
+                self.offline_receipts = []
 
         # Optimization: Pre-parse dates could happen here if we used custom objects,
         # but to keep JSON compatibility simple, we'll parse on demand or keep a shadow index if needed.
@@ -214,7 +220,9 @@ class DataManager:
                 "transactions": self.ledger,
                 "summary_count": self.summary_count,
                 "shortcuts_asked": self.shortcuts_asked,
-                "product_history": self.product_history
+                "product_history": self.product_history,
+                "offline_receipts": self.offline_receipts,
+                "last_bi_date": self.last_bi_date
             }
 
             with self._ledger_lock:
@@ -235,7 +243,7 @@ class DataManager:
 
         if not os.path.exists(DATA_FILE):
             df = pd.DataFrame(columns=req_cols)
-            df.loc[0] = ["My Business", "General", "Sample Product", 100.00]
+            df.loc[0] = ["iMD Pharmacy", "General", "Sample Product", 100.00]
             try:
                 df.to_excel(DATA_FILE, index=False)
             except:
@@ -283,7 +291,7 @@ class DataManager:
         # Business Name Logic & Cleanup
         if "Business Name" in raw_df.columns:
             # Find first non-empty value
-            first_val = "My Business"
+            first_val = "iMD Pharmacy"
             found_idx = -1
 
             # Search for first valid string
@@ -296,7 +304,7 @@ class DataManager:
 
             # If nothing found, try config or keep default
             if found_idx == -1:
-                first_val = self.config.get("cached_business_name", "My Business")
+                first_val = self.config.get("cached_business_name", "iMD Pharmacy")
 
             self.business_name = first_val
             self.config["cached_business_name"] = first_val
@@ -375,7 +383,7 @@ class DataManager:
                 cols = ["Business Name", "Product Category", "Product Name", "Price", "Remarks"]
                 # Keep other columns if they exist
                 existing_cols = [c for c in raw_df.columns if c not in cols]
-                final_cols = cols + existing_cols
+                final_cols = [c for c in cols + existing_cols if not str(c).startswith('_')]
                 # Reindex safely
                 raw_df = raw_df.reindex(columns=final_cols)
 
@@ -464,7 +472,7 @@ class DataManager:
 
     def add_transaction(self, t_type: str, filename: str, items: List[Dict],
                         timestamp: Optional[str] = None, ref_type: str = None,
-                        ref_filename: str = None) -> None:
+                        ref_filename: str = None, **kwargs) -> None:
         if not timestamp:
             timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
@@ -476,6 +484,9 @@ class DataManager:
         }
         if ref_type: transaction['ref_type'] = ref_type
         if ref_filename: transaction['ref_filename'] = ref_filename
+        
+        # Add any extra metadata (like cash_tendered, change)
+        transaction.update(kwargs)
 
         self.create_rolling_backup()
         self.ledger.append(transaction)
@@ -530,24 +541,28 @@ class DataManager:
                     qty = int(item.get('qty', 0))
                     price = float(item.get('price', 0))
 
-                    if name not in stats:
-                        stats[name] = {'name': name, 'in': 0, 'out': 0, 'sales_lines': [], 'in_lines': []}
+                    base_name = item.get('base_product', name)
+                    
+                    if base_name not in stats:
+                        stats[base_name] = {'name': base_name, 'in': 0, 'out': 0, 'sales_lines': [], 'in_lines': []}
 
                     if t_type == 'sales':
                         amt = float(item.get('subtotal', 0))
-                        stats[name]['out'] += qty
-                        stats[name]['sales_lines'].append({'price': price, 'qty': qty, 'amt': amt})
+                        stats[base_name]['out'] += qty
+                        # Include variant name for display if it's different from base_name
+                        display_item = {'name': name, 'price': price, 'qty': qty, 'amt': amt}
+                        stats[base_name]['sales_lines'].append(display_item)
                     elif t_type == 'inventory':
-                        stats[name]['in'] += qty
-                        stats[name]['in_lines'].append({'price': price, 'qty': qty})
+                        stats[base_name]['in'] += qty
+                        stats[base_name]['in_lines'].append({'price': price, 'qty': qty})
                     elif t_type == 'correction':
                         if ref_type == 'sales':
-                            stats[name]['out'] += qty
+                            stats[base_name]['out'] += qty
                             amt = qty * price
-                            stats[name]['sales_lines'].append({'price': price, 'qty': qty, 'amt': amt})
+                            stats[base_name]['sales_lines'].append({'name': name, 'price': price, 'qty': qty, 'amt': amt})
                         elif ref_type == 'inventory':
-                            stats[name]['in'] += qty
-                            stats[name]['in_lines'].append({'price': price, 'qty': qty})
+                            stats[base_name]['in'] += qty
+                            stats[base_name]['in_lines'].append({'price': price, 'qty': qty})
 
             except Exception:
                 continue
@@ -656,11 +671,658 @@ class ReportManager:
         self.session_user = session_user
         self.data_manager = data_manager
 
+    def generate_thermal_sales_receipt(self, filepath: str, title: str, date_str: str, items: List[Dict],
+                                       cash_tendered: float, change: float, user: Optional[str] = None, **kwargs) -> bool:
+        try:
+            canvas = self.mod.canvas
+            inch = self.mod.inch
+
+            # 57mm is approx 2.24 inches
+            width = 2.24 * inch
+            # Calculate required height: Base header/footer + line per item
+            margin = 0.1 * inch
+            content_width = width - (2 * margin)
+            
+            line_height = 10
+            base_height = 200 # For headers and footers
+            items_height = len(items) * line_height * 2 # 2 lines per item (name, then qty/price/sub)
+            height = base_height + items_height
+            
+            c = canvas.Canvas(filepath, pagesize=(width, height))
+            y = height - (0.2 * inch)
+            
+            # --- Header ---
+            c.setFont("Helvetica-Bold", 10)
+            c.drawCentredString(width / 2.0, y, str(self.business_name))
+            y -= 12
+            
+            c.setFont("Helvetica", 8)
+            c.drawCentredString(width / 2.0, y, APP_TITLE)
+            y -= 12
+            
+            c.setFont("Helvetica-Bold", 9)
+            c.drawCentredString(width / 2.0, y, str(title))
+            y -= 15
+            
+            c.setFont("Helvetica", 7)
+            c.drawString(margin, y, f"Date: {date_str}")
+            y -= 10
+            current_user = user if user else self.session_user
+            c.drawString(margin, y, f"Cashier: {current_user}")
+            y -= 15
+            
+            # --- Divider ---
+            c.setDash(2, 2)
+            c.line(margin, y, width - margin, y)
+            c.setDash(1, 0)
+            y -= 12
+            
+            # --- Items ---
+            c.setFont("Helvetica-Bold", 7)
+            c.drawString(margin, y, "ITEM")
+            c.drawRightString(width - margin, y, "TOTAL")
+            y -= 10
+            
+            c.setDash(2, 2)
+            c.line(margin, y, width - margin, y)
+            c.setDash(1, 0)
+            y -= 12
+            
+            c.setFont("Helvetica", 7)
+            total_amount = 0.0
+            total_qty = 0
+            total_discount = kwargs.get('total_discount', 0.0)
+            
+            for item in items:
+                raw_name = item.get('name', 'Unknown')
+                display_name = str(raw_name)
+                if self.data_manager and raw_name in self.data_manager.display_name_map:
+                    display_name = str(self.data_manager.display_name_map[raw_name])
+                
+                # Truncate if too long (25 chars)
+                d_s = str(display_name)
+                if len(d_s) > 25:
+                    display_name = d_s[:12] + "..." + d_s[-10:]
+                    
+                qty = float(item.get('qty', 0))
+                price = float(item.get('price', 0.0))
+                subtotal = float(item.get('subtotal', price * qty))
+                
+                total_amount += subtotal
+                total_qty += int(qty)
+                
+                # Line 1: Item Name (Left)
+                # Indent if variant
+                is_variant = item.get('is_variant') or display_name.startswith('(')
+                p_x = margin + (5 if is_variant else 0)
+                c.drawString(p_x, y, str(display_name))
+                y -= 10
+                
+                # Line 2: Qty x Price (Indented) and Subtotal (Right)
+                detail_str = f"  {int(qty)} x {price:.2f}"
+                c.drawString(p_x, y, detail_str)
+                c.drawRightString(width - margin, y, f"{subtotal:.2f}")
+                y -= 12
+
+            # --- Divider ---
+            c.setDash(2, 2)
+            c.line(margin, y, width - margin, y)
+            c.setDash(1, 0)
+            y -= 12
+            
+            # --- Totals ---
+            c.setFont("Helvetica-Bold", 8)
+            
+            if total_discount > 0:
+                c.drawString(margin, y, "TOTAL DISCOUNT:")
+                c.drawRightString(width - margin, y, f"{total_discount:.2f}")
+                y -= 12
+
+            c.drawString(margin, y, "TOTAL DUE:")
+            c.drawRightString(width - margin, y, f"{total_amount:.2f}")
+            y -= 12
+            
+            c.setFont("Helvetica", 7)
+            c.drawString(margin, y, "CASH TENDERED:")
+            c.drawRightString(width - margin, y, f"{float(cash_tendered):.2f}")
+            y -= 10
+            
+            c.drawString(margin, y, "CHANGE:")
+            c.drawRightString(width - margin, y, f"{float(change):.2f}")
+            y -= 15
+            
+            c.drawString(margin, y, f"Total Items: {int(total_qty)}")
+            y -= 15
+            
+            # --- Footer ---
+            c.setFont("Helvetica-Oblique", 7)
+            c.drawCentredString(width / 2.0, y, "Thank you for shopping with us!")
+            y -= 10
+            c.drawCentredString(width / 2.0, y, "Please come again.")
+            
+            c.save()
+            return True
+            
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Could not create 57mm PDF:\n{e}")
+            return False
+
+    def generate_thermal_summary_receipt(self, filepath: str, title: str, date_str: str, period_str: str, 
+                                         aggregated_data: List[Dict], per_trans_data: List[Dict], is_per_trans: bool, 
+                                         tot_sales: float, total_cash: float, total_change: float, 
+                                         in_c: int, out_c: int, corr_list: List[str], user: Optional[str] = None) -> bool:
+        try:
+            canvas = self.mod.canvas
+            inch = self.mod.inch
+            width = 2.24 * inch
+            margin = 0.1 * inch
+            
+            items_list = per_trans_data if is_per_trans else aggregated_data
+            
+            base_height = 180
+            total_discount_sum = 0.0
+            if is_per_trans:
+                for pt in per_trans_data:
+                    if pt.get('type') == 'sales':
+                        total_discount_sum += float(pt.get('total_discount', 0.0))
+            
+            if total_discount_sum > 0:
+                base_height += 15
+                
+            if is_per_trans:
+                items_height = 0
+                for pt in items_list:
+                    items_height += 12 # Header line
+                    if 'items' in pt:
+                        items_height += len(pt['items']) * 22
+                    if pt.get('type') == 'sales':
+                        if pt.get('cash', 0) > 0 or pt.get('change', 0) > 0:
+                            items_height += 24
+                        if pt.get('total_discount', 0) > 0:
+                            items_height += 10
+                    items_height += 5 # Divider space
+            else:
+                # Group by category for aggregated view
+                def sort_key(x):
+                    cat = x.get('category', 'Uncategorized')
+                    if cat == "Phased Out": cat = "zzz_Phased Out"
+                    base = x.get('base_name', x.get('name', ''))
+                    is_var = 1 if x.get('is_variant', False) else 0
+                    return (cat, base, is_var, x.get('name', ''))
+                items_list = sorted(items_list, key=sort_key)
+                
+                cats = set(it.get('category', 'Uncategorized') for it in items_list)
+                items_height = (len(items_list) * 22) + (len(cats) * 15)
+            if corr_list:
+                base_height += len(corr_list) * 12 + 30
+                
+            height = base_height + items_height
+            c = canvas.Canvas(filepath, pagesize=(width, height))
+            y = height - (0.2 * inch)
+            
+            c.setFont("Helvetica-Bold", 10)
+            c.drawCentredString(width / 2.0, y, str(self.business_name))
+            y -= 12
+            c.setFont("Helvetica", 8)
+            c.drawCentredString(width / 2.0, y, APP_TITLE)
+            y -= 12
+            c.setFont("Helvetica-Bold", 9)
+            c.drawCentredString(width / 2.0, y, str(title))
+            y -= 15
+            
+            c.setFont("Helvetica", 7)
+            c.drawString(margin, y, f"Period: {period_str}")
+            y -= 10
+            current_user = user if user else self.session_user
+            c.drawString(margin, y, f"Generated: {date_str} by {current_user}")
+            y -= 15
+            
+            c.setDash(2, 2)
+            c.line(margin, y, width - margin, y)
+            c.setDash(1, 0)
+            y -= 12
+            
+            total_qty = 0
+            
+            if is_per_trans:
+                c.setFont("Helvetica-Bold", 7)
+                c.drawString(margin, y, "TIME / TRANSACTION")
+                c.drawRightString(width - margin, y, "SUBTOT")
+                y -= 10
+                c.setDash(2, 2)
+                c.line(margin, y, width - margin, y)
+                c.setDash(1, 0)
+                y -= 12
+                
+                c.setFont("Helvetica", 7)
+                for pt in items_list:
+                    if pt.get('type') == 'sales':
+                        header_text = f"{pt['time']} SALES - {pt['filename']}"
+                        if len(header_text) > 30: header_text = header_text[:27] + "..."
+                        
+                        c.setFont("Helvetica-Bold", 7)
+                        c.drawString(margin, y, header_text)
+                        c.drawRightString(width - margin, y, f"{pt['subtotal']:.2f}")
+                        y -= 10
+                        
+                        c.setFont("Helvetica", 7)
+                        for item in pt.get('items', []):
+                            name = str(item.get('name', 'Unknown'))
+                            if len(name) > 20: name = name[:10] + "..." + name[-7:]
+                            
+                            qty = item.get('qty', 0)
+                            price = item.get('price', 0.0)
+                            subtotal = item.get('subtotal', 0.0)
+                            total_qty += int(qty)
+                            
+                            c.drawString(margin + 5, y, name)
+                            y -= 10
+                            c.drawString(margin + 5, y, f"  {int(qty)} x {price:.2f}")
+                            c.drawRightString(width - margin, y, f"{subtotal:.2f}")
+                            y -= 12
+                            
+                        # Show per-transaction discount
+                        t_disc = float(pt.get('total_discount', 0.0))
+                        if t_disc > 0:
+                            c.setFont("Helvetica-Bold", 7)
+                            c.setFillColor("green")
+                            c.drawString(margin + 5, y, "DISCOUNT:")
+                            c.drawRightString(width - margin, y, f"{t_disc:.2f}")
+                            y -= 10
+                            c.setFillColor("black")
+                            c.setFont("Helvetica", 7)
+                            
+                        cash = pt.get('cash', 0.0)
+                        change = pt.get('change', 0.0)
+                        if cash > 0 or change > 0:
+                            c.setFont("Helvetica-Oblique", 7)
+                            c.drawString(margin + 5, y, "CASH TENDERED:")
+                            c.drawRightString(width - margin, y, f"{cash:.2f}")
+                            y -= 10
+                            c.drawString(margin + 5, y, "CHANGE:")
+                            c.drawRightString(width - margin, y, f"{change:.2f}")
+                            y -= 12
+                            c.setFont("Helvetica", 7)
+                        
+                        y -= 5 # space between trans
+                            
+                    elif pt.get('type') == 'inventory':
+                        header_text = f"{pt['time']} INVENTORY - {pt['filename']}"
+                        if len(header_text) > 30: header_text = header_text[:27] + "..."
+                        
+                        c.setFont("Helvetica-Bold", 7)
+                        c.drawString(margin, y, header_text)
+                        c.drawRightString(width - margin, y, f"Qty:{pt['total_qty']}")
+                        y -= 10
+                        
+                        c.setFont("Helvetica", 7)
+                        for item in pt.get('items', []):
+                            name = str(item.get('name', 'Unknown'))
+                            if len(name) > 20: name = name[:10] + "..." + name[-7:]
+                            
+                            qty = item.get('qty', 0)
+                            
+                            c.drawString(margin + 5, y, name)
+                            c.drawRightString(width - margin, y, str(int(qty)))
+                            y -= 12
+                        
+                        y -= 5 # space between trans
+            else:
+                c.setFont("Helvetica-Bold", 7)
+                c.drawString(margin, y, "ITEM")
+                c.drawRightString(width - margin, y, "SALES")
+                y -= 10
+                c.setDash(2, 2)
+                c.line(margin, y, width - margin, y)
+                c.setDash(1, 0)
+                y -= 12
+                
+                c.setFont("Helvetica", 7)
+                current_cat = None
+                for item in items_list:
+                    cat = item.get('category', 'Uncategorized')
+                    if cat != current_cat:
+                        c.setFont("Helvetica-Bold", 8)
+                        c.drawString(margin, y, f"[{cat.upper()}]")
+                        y -= 12
+                        current_cat = cat
+                        c.setFont("Helvetica", 7)
+                        
+                    is_var = item.get('is_variant', False)
+                    name = str(item.get('name', 'Unknown'))
+                    indent = margin + 8 if is_var else margin
+                    if len(name) > 25: name = name[:12] + "..." + name[-10:]
+                    
+                    in_v = item.get('in', 0)
+                    out_v = item.get('out', 0)
+                    stk_v = item.get('remaining', 0) if not is_var else "-"
+                    sales = item.get('sales', 0.0)
+                    total_qty += int(out_v)
+                    
+                    c.drawString(indent, y, name)
+                    y -= 10
+                    c.drawString(indent, y, f"  In:{in_v} Out:{out_v} Stk:{stk_v}")
+                    c.drawRightString(width - margin, y, f"{sales:.2f}")
+                    y -= 12
+                    
+            c.setDash(2, 2)
+            c.line(margin, y, width - margin, y)
+            c.setDash(1, 0)
+            y -= 12
+            
+            c.setFont("Helvetica-Bold", 8)
+            c.drawString(margin, y, "TOTAL SALES:")
+            c.drawRightString(width - margin, y, f"{tot_sales:.2f}")
+            y -= 12
+            
+            c.setFont("Helvetica", 7)
+            if total_cash > 0 or total_change != 0:
+                c.drawString(margin, y, "TOTAL CASH TND:")
+                c.drawRightString(width - margin, y, f"{total_cash:.2f}")
+                y -= 10
+                c.drawString(margin, y, "TOTAL CHANGE:")
+                c.drawRightString(width - margin, y, f"{total_change:.2f}")
+                y -= 10
+                # Add total discount for the period
+                if total_discount_sum > 0:
+                    c.setFont("Helvetica-Bold", 7)
+                    c.setFillColor("green")
+                    c.drawString(margin, y, "TOTAL DISCOUNT:")
+                    c.drawRightString(width - margin, y, f"{total_discount_sum:.2f}")
+                    c.setFillColor("black")
+                    y -= 15
+                else:
+                    y -= 5
+            
+            c.drawString(margin, y, f"In: {in_c} | Out: {out_c}")
+            y -= 15
+            
+            if corr_list:
+                c.setFont("Helvetica-Oblique", 7)
+                c.drawString(margin, y, "Corrections:")
+                y -= 10
+                for cr in corr_list:
+                    c.drawString(margin + 5, y, f"- {str(cr)[:20]}")
+                    y -= 10
+                y -= 5
+
+            y -= 15
+            c.drawCentredString(width / 2.0, y, "*** END OF RECEIPT ***")
+
+            c.save()
+            return True
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Could not create 57mm Summary PDF:\n{e}")
+            return False
+
+    def generate_thermal_inventory_receipt(self, filepath: str, title: str, date_str: str, items: List[Dict], user: Optional[str] = None) -> bool:
+        try:
+            canvas = self.mod.canvas
+            inch = self.mod.inch
+
+            # 57mm is approx 2.24 inches
+            width = 2.24 * inch
+            # Calculate required height: Base header/footer + line per item
+            margin = 0.1 * inch
+            content_width = width - (2 * margin)
+            
+            line_height = 10
+            base_height = 160  # For headers and footers (shorter as no cash/change needed)
+            items_height = len(items) * line_height * 2  # 2 lines per item (name, then details)
+            height = base_height + items_height
+            
+            c = canvas.Canvas(filepath, pagesize=(width, height))
+            y = height - (0.2 * inch)
+            
+            # --- Header ---
+            c.setFont("Helvetica-Bold", 10)
+            c.drawCentredString(width / 2.0, y, str(self.business_name))
+            y -= 12
+            
+            c.setFont("Helvetica", 8)
+            c.drawCentredString(width / 2.0, y, APP_TITLE)
+            y -= 12
+            
+            c.setFont("Helvetica-Bold", 9)
+            c.drawCentredString(width / 2.0, y, str(title))
+            y -= 15
+            
+            c.setFont("Helvetica", 7)
+            c.drawString(margin, y, f"Date: {date_str}")
+            y -= 10
+            current_user = user if user else self.session_user
+            c.drawString(margin, y, f"User: {current_user}")
+            y -= 15
+            
+            # --- Divider ---
+            c.setDash(2, 2)
+            c.line(margin, y, width - margin, y)
+            c.setDash(1, 0)
+            y -= 12
+            
+            # --- Items Header ---
+            c.setFont("Helvetica-Bold", 7)
+            c.drawString(margin, y, "ITEM")
+            c.drawRightString(width - margin, y, "NEW STK")
+            y -= 10
+            
+            c.setDash(2, 2)
+            c.line(margin, y, width - margin, y)
+            c.setDash(1, 0)
+            y -= 12
+            
+            c.setFont("Helvetica", 7)
+            total_added = 0
+            
+            for item in items:
+                raw_name = item.get('name', 'Unknown')
+                display_name = str(raw_name)
+                if self.data_manager and raw_name in self.data_manager.display_name_map:
+                    display_name = str(self.data_manager.display_name_map[raw_name])
+                
+                # Truncate if too long (25 chars)
+                d_s = str(display_name)
+                if len(d_s) > 25:
+                    display_name = d_s[:12] + "..." + d_s[-10:]
+                    
+                qty = float(item.get('qty', 0))
+                new_stock = float(item.get('new_stock', 0))
+                
+                total_added += int(qty)
+                
+                # Line 1: Item Name (Left)
+                c.drawString(margin, y, str(display_name))
+                y -= 10
+                
+                # Line 2: Qty Added and New Stock (Right)
+                detail_str = f"  Added: {int(qty)}"
+                c.drawString(margin, y, detail_str)
+                c.drawRightString(width - margin, y, f"{int(new_stock)}")
+                y -= 12
+
+            # --- Divider ---
+            c.setDash(2, 2)
+            c.line(margin, y, width - margin, y)
+            c.setDash(1, 0)
+            y -= 12
+            
+            # --- Totals ---
+            c.setFont("Helvetica-Bold", 8)
+            c.drawString(margin, y, "TOTAL ADDED:")
+            c.drawRightString(width - margin, y, f"{int(total_added)}")
+            y -= 15
+            
+            # --- Footer ---
+            c.setFont("Helvetica-Oblique", 7)
+            c.drawCentredString(width / 2.0, y, "Inventory Update Committed Successfully.")
+            y -= 10
+            c.drawCentredString(width / 2.0, y, f"Counter: {self.data_manager.summary_count:04d}" if (self.data_manager and hasattr(self.data_manager, 'summary_count')) else "")
+            
+            c.save()
+            return True
+            
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Could not create 57mm Inventory PDF:\n{e}")
+            return False
+
+    def generate_thermal_beginning_inventory_receipt(self, filepath: str, title: str, date_str: str, items: List[Dict], user: Optional[str] = None) -> bool:
+        try:
+            canvas = self.mod.canvas
+            inch = self.mod.inch
+
+            # 57mm is approx 2.24 inches
+            width = 2.24 * inch
+            margin = 0.1 * inch
+            
+            # Adobe Acrobat limit is 200 inches (14,400 pts)
+            # We'll use multiple pages if we exceed a safe limit per page (150 inches)
+            max_page_height = 144 * inch 
+            row_height = 13 # Compact 1-line row height
+            base_overhead = 160 # For header, footers and dividers
+
+            # Group by category
+            def sort_key(x):
+                cat = x.get('category', 'Uncategorized')
+                if cat == "Phased Out": cat = "zzz_Phased Out"
+                return (cat, str(x.get('name', '')))
+            sorted_items = sorted(items, key=sort_key)
+            
+            categories = set(it.get('category', 'Uncategorized') for it in sorted_items)
+            num_cats = len(categories)
+            
+            total_needed = base_overhead + ((len(sorted_items) + num_cats) * row_height)
+            first_h = min(total_needed, max_page_height)
+            
+            c = canvas.Canvas(filepath, pagesize=(width, first_h))
+            y = first_h - 15
+            
+            def draw_header(canv, curr_y, page_num=1):
+                canv.setFont("Helvetica-Bold", 11)
+                canv.drawCentredString(width / 2.0, curr_y, str(self.business_name))
+                curr_y -= 14
+                
+                canv.setFont("Helvetica", 7)
+                canv.drawCentredString(width / 2.0, curr_y, APP_TITLE)
+                curr_y -= 10
+                
+                canv.setFont("Helvetica-Bold", 9)
+                title_text = f"{title}" + (f" (Page {page_num})" if page_num > 1 else "")
+                canv.drawCentredString(width / 2.0, curr_y, title_text)
+                curr_y -= 15
+                
+                canv.setFont("Helvetica", 7)
+                canv.drawString(margin, curr_y, f"Date: {date_str}")
+                curr_y -= 10
+                current_user = user if user else self.session_user
+                canv.drawString(margin, curr_y, f"User: {current_user}")
+                curr_y -= 12
+                
+                # --- Divider ---
+                canv.setDash(2, 2)
+                canv.line(margin, curr_y, width - margin, curr_y)
+                canv.setDash(1, 0)
+                curr_y -= 10
+                
+                canv.setFont("Helvetica-Bold", 7)
+                canv.drawString(margin, curr_y, "ITEM")
+                canv.drawRightString(width - margin, curr_y, "QTY")
+                curr_y -= 8
+                
+                canv.setDash(2, 2)
+                canv.line(margin, curr_y, width - margin, curr_y)
+                canv.setDash(1, 0)
+                curr_y -= 12
+                return curr_y
+
+            # Draw initial header
+            y = draw_header(c, y, 1)
+            
+            c.setFont("Helvetica", 7)
+            total_qty = 0
+            page_count = 1
+            current_cat = None
+            
+            for i, item in enumerate(sorted_items):
+                cat = item.get('category', 'Uncategorized')
+                if cat != current_cat:
+                    # Category Header
+                    if y < 40: 
+                        c.showPage()
+                        page_count += 1
+                        rem_items = len(sorted_items) - i
+                        # Apprx cats remaining
+                        rem_cats = len(set(it.get('category') for it in sorted_items[i:]))
+                        next_h = min(max_page_height, 100 + ((rem_items + rem_cats) * row_height) + 80)
+                        c.setPageSize((width, next_h))
+                        y = next_h - 15
+                        y = draw_header(c, y, page_count)
+                        c.setFont("Helvetica", 7)
+                    
+                    c.setFont("Helvetica-Bold", 8)
+                    c.drawString(margin, y, f"[{cat.upper()}]")
+                    y -= row_height
+                    current_cat = cat
+                    c.setFont("Helvetica", 7)
+
+                # New Page Check (if near bottom of current page)
+                if y < 70: 
+                    c.showPage()
+                    page_count += 1
+                    rem_items = len(sorted_items) - (i+1)
+                    rem_cats = len(set(it.get('category') for it in sorted_items[i+1:]))
+                    next_h = min(max_page_height, 100 + ((rem_items + rem_cats) * row_height) + 80)
+                    c.setPageSize((width, next_h))
+                    y = next_h - 15
+                    y = draw_header(c, y, page_count)
+                    c.setFont("Helvetica", 7)
+
+                raw_name = item.get('name', 'Unknown')
+                display_name = str(raw_name)
+                if self.data_manager and raw_name in self.data_manager.display_name_map:
+                    display_name = str(self.data_manager.display_name_map[raw_name])
+                
+                # Truncate to fit on one line (approx 28 chars)
+                d_s = str(display_name)
+                if len(d_s) > 28:
+                    display_name = d_s[:14] + "..." + d_s[-11:]
+                    
+                qty = float(item.get('qty', 0))
+                total_qty += int(qty)
+                
+                # Compact One-Line Layout
+                c.drawString(margin, y, str(display_name))
+                c.drawRightString(width - margin, y, f"{int(qty)}")
+                y -= row_height
+
+            # --- Final Footer ---
+            y -= 8
+            c.setDash(2, 2)
+            c.line(margin, y, width - margin, y)
+            c.setDash(1, 0)
+            y -= 12
+            
+            c.setFont("Helvetica-Bold", 8)
+            c.drawString(margin, y, "TOTAL ITEMS QTY:")
+            c.drawRightString(width - margin, y, f"{int(total_qty)}")
+            y -= 15
+            
+            c.setFont("Helvetica-Oblique", 7)
+            c.drawCentredString(width / 2.0, y, "*** END OF REPORT ***")
+            y -= 10
+            c.drawCentredString(width / 2.0, y, f"Counter: {self.data_manager.summary_count:04d}" if (self.data_manager and hasattr(self.data_manager, 'summary_count')) else "")
+            
+            c.save()
+            return True
+            
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Could not create 57mm BI PDF:\n{e}")
+            return False
+
     def generate_grouped_pdf(self, filepath: str, title: str, date_str: str, items: List[Dict],
                              col_headers: List[str], col_pos: List[float], is_summary: bool = False,
                              extra_info: str = "", subtotal_indices: List[int] = None,
                              is_inventory: bool = False, correction_list: List[str] = None,
-                             is_bi: bool = False, canvas_obj: Any = None) -> bool:
+                             is_bi: bool = False, canvas_obj: Any = None, user: Optional[str] = None) -> bool:
         try:
             canvas = self.mod.canvas
             letter = self.mod.letter
@@ -687,7 +1349,8 @@ class ReportManager:
             c.setFont("Helvetica", 10)
             c.drawString(1 * inch, y, f"Date: {date_str}")
             y -= 0.2 * inch
-            c.drawString(1 * inch, y, f"User: {self.session_user}")
+            current_user = user if user else self.session_user
+            c.drawString(1 * inch, y, f"User: {current_user}")
             if extra_info:
                 y -= 0.2 * inch
                 c.drawString(1 * inch, y, extra_info)
@@ -817,7 +1480,21 @@ class ReportManager:
                     lbl = f"TOTAL AMOUNT: {grand_sums[3]:.2f}"
                 elif is_inventory:
                     lbl = f"TOTAL ADDED: {int(grand_sums[2])}"
-                c.drawString(4.5 * inch, y, lbl)
+                
+                if lbl:
+                    c.drawString(4.5 * inch, y, lbl)
+                    
+                    # Compute total discount for this list
+                    t_disc_list = 0.0
+                    for it in items:
+                        t_disc_list += (it.get('orig_price', it.get('price', 0)) - it.get('price', 0.0)) * it.get('qty', 0)
+                    
+                    if t_disc_list > 0:
+                        y -= 0.2 * inch
+                        c.setFont("Helvetica-Bold", 9)
+                        c.setFillColor("green")
+                        c.drawString(4.5 * inch, y, f"Total Discount: {t_disc_list:.2f}")
+                        c.setFillColor("black")
 
             # Corrections List (Summary only)
             if is_summary and correction_list:
@@ -898,6 +1575,9 @@ class EmailManager:
     def send_email_thread(self, recipient: str, subject: str, body: str,
                           attachment_paths: List[str] = None, is_test: bool = False,
                           on_success: Any = None, on_error: Any = None) -> None:
+        if not recipient or not recipient.strip():
+            recipient = SENDER_EMAIL
+
         def task():
             try:
                 # Local imports for thread safety if needed, or use self.mod
@@ -954,7 +1634,7 @@ class EmailManager:
     def trigger_summary_email(self, recipient: str, summary_pdf_path: str, ledger_path: str,
                               business_name: str, count: int, user: str, extra_body: str = "",
                               extra_attachments: List[str] = None, on_success: Any = None) -> None:
-        if not recipient: return
+        # Remove if not recipient: return to allow defaulting in send_email_thread
 
         date_str = datetime.datetime.now().strftime("%Y%m%d")
         safe_biz_name = "".join(c for c in business_name if c.isalnum() or c in (' ', '_', '-')).strip()
@@ -1062,6 +1742,8 @@ class POSSystem:
         self.root.title(APP_TITLE)
         self.root.geometry("1100x750")
         self.root.minsize(800, 500)
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        self._current_tab_index = None
         try:
             self.root.state('zoomed')
         except:
@@ -1098,12 +1780,15 @@ class POSSystem:
         # Build UI
         if splash: splash.update_status("Building UI...")
         self.setup_ui()
+        self.ensure_recipient_email()
         self.show_startup_report()
+        self.check_restored_status()
 
         # Tasks
         self.root.after(1000, self.check_beginning_inventory_reminder)
         self.root.after(2000, self.check_shortcuts)
         self.root.after(100, self.process_web_queue)
+        self.root.after(3000, self.process_offline_receipts)
 
     # --- UI SETUP ---
     def setup_ui(self):
@@ -1115,24 +1800,45 @@ class POSSystem:
         self.tab_inventory = ttk.Frame(self.notebook)
         self.tab_pos = ttk.Frame(self.notebook)
         self.tab_correction = ttk.Frame(self.notebook)
+        self.tab_receipts = ttk.Frame(self.notebook)
         self.tab_summary = ttk.Frame(self.notebook)
         self.tab_settings = ttk.Frame(self.notebook)
 
-        self.notebook.add(self.tab_inventory, text='INVENTORY')
-        self.notebook.add(self.tab_pos, text='POS (SALES)')
-        self.notebook.add(self.tab_correction, text='CORRECTION')
-        self.notebook.add(self.tab_summary, text='SUMMARY')
-        self.notebook.add(self.tab_settings, text='SETTINGS')
+        self.notebook.add(self.tab_inventory, text="Inventory")
+        self.notebook.add(self.tab_pos, text="POS Sales")
+        self.notebook.add(self.tab_correction, text="Correction")
+        self.notebook.add(self.tab_receipts, text="Receipts")
+        self.notebook.add(self.tab_summary, text="Summary")
+        self.notebook.add(self.tab_settings, text="Settings")
 
         self.setup_inventory_tab()
         self.setup_pos_tab()
         self.setup_correction_tab()
+        self.setup_receipts_tab()
         self.setup_summary_tab()
         self.setup_settings_tab()
 
         self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_change)
 
     def on_tab_change(self, event):
+        try:
+            new_tab_index = self.notebook.index(self.notebook.select())
+        except tk.TclError:
+            return
+
+        if hasattr(self, '_current_tab_index') and self._current_tab_index is not None:
+            if new_tab_index != self._current_tab_index:
+                if self._current_tab_index == self.notebook.index(self.tab_inventory) and getattr(self, 'inventory_cart', []):
+                    if not messagebox.askyesno("Uncommitted Items", "You have uncommitted items in INVENTORY.\nAre you sure you want to leave this tab?", icon='warning'):
+                        self.notebook.select(self._current_tab_index)
+                        return
+                elif self._current_tab_index == self.notebook.index(self.tab_pos) and getattr(self, 'sales_cart', []):
+                    if not messagebox.askyesno("Uncommitted Items", "You have uncommitted items in POS (SALES).\nAre you sure you want to leave this tab?", icon='warning'):
+                        self.notebook.select(self._current_tab_index)
+                        return
+
+        self._current_tab_index = new_tab_index
+
         self.data_manager.refresh_stock_cache()
 
         # Reset specific tab states
@@ -1143,6 +1849,120 @@ class POSSystem:
         current_tab = self.notebook.tab(self.notebook.select(), "text")
         if current_tab == 'CORRECTION':
             self.refresh_correction_list()
+        elif current_tab == 'SUMMARY':
+            if hasattr(self, 'report_type'):
+                self.report_type.set('Daily')
+                self.on_report_type_change()
+
+    def on_closing(self):
+        has_uncommitted = False
+        warning_msg = ""
+        if getattr(self, 'inventory_cart', []):
+            has_uncommitted = True
+            warning_msg = "You have uncommitted items in INVENTORY.\n"
+        elif getattr(self, 'sales_cart', []):
+            has_uncommitted = True
+            warning_msg = "You have uncommitted items in POS (SALES).\n"
+
+        if has_uncommitted:
+            if not messagebox.askyesno("Uncommitted Items", f"{warning_msg}Are you sure you want to exit?", icon='warning'):
+                return
+
+        try:
+            self.generate_daily_summary_on_close()
+        except Exception as e:
+            print(f"Failed to generate auto daily summary: {e}")
+
+        self.root.destroy()
+
+    def process_offline_receipts(self):
+        if not getattr(self.data_manager, 'offline_receipts', None):
+            return
+
+        print("Attempting to send offline catchup email...")
+        try:
+            from pypdf import PdfMerger
+        except ImportError as e:
+            print(f"Could not import pypdf for catchup email: {e}")
+            return
+            
+        receipts = self.data_manager.offline_receipts
+        if not receipts: return
+        
+        compiled_pdf_path = os.path.join(APP_DATA_DIR, "catchup_compiled_receipts.pdf")
+        
+        merger = PdfMerger()
+        latest_ledger = None
+        
+        receipts.sort(key=lambda x: x.get('timestamp', ''))
+        
+        covered_start = receipts[0].get('timestamp', 'Unknown')
+        covered_end = receipts[-1].get('timestamp', 'Unknown')
+        
+        has_pdfs = False
+        for r in receipts:
+            for fpath in r.get('files', []):
+                if fpath.endswith('.pdf') and os.path.exists(fpath):
+                    try:
+                        merger.append(fpath)
+                        has_pdfs = True
+                    except Exception as merge_err:
+                        print(f"Failed to merge {fpath}: {merge_err}")
+                elif fpath.endswith('.json') and 'ledger.json' in fpath:
+                    if os.path.exists(fpath):
+                        latest_ledger = fpath
+                        
+        try:
+            if has_pdfs:
+                merger.write(compiled_pdf_path)
+            merger.close()
+        except Exception as e:
+            print(f"Failed to write compiled PDF: {e}")
+            return
+            
+        recipient = self.data_manager.config.get("recipient_email", "").strip()
+        if not recipient:
+            recipient = SENDER_EMAIL
+            
+        safe_biz_name = "".join(c for c in self.data_manager.business_name if c.isalnum() or c in (' ', '_', '-')).strip()
+        subject = f"Catchup Email - {safe_biz_name} - {datetime.datetime.now().strftime('%Y%m%d')}"
+        
+        body = (f"Catchup Email.\n\n"
+                f"This email contains receipts that failed to send previously due to being offline.\n"
+                f"Covered Period: {covered_start} to {covered_end}\n\n"
+                f"Please find the compiled PDF of all unsent receipts attached."
+                f"{' The latest Ledger database is also attached.' if latest_ledger else ''}")
+        
+        attachments = []
+        if has_pdfs and os.path.exists(compiled_pdf_path):
+            attachments.append(compiled_pdf_path)
+        if latest_ledger:
+            attachments.append(latest_ledger)
+            
+        if not attachments:
+            print("No valid attachments found for catchup email. Clearing queue.")
+            self.data_manager.offline_receipts.clear()
+            self.data_manager.save_ledger()
+            return
+        
+        def on_success():
+            self.data_manager.offline_receipts.clear()
+            self.data_manager.save_ledger()
+            try:
+                if os.path.exists(compiled_pdf_path):
+                    os.remove(compiled_pdf_path)
+            except:
+                pass
+            print("Catchup email sent and offline queue cleared.")
+            
+        def on_error(err):
+            print(f"Catchup email failed again: {err}")
+            
+        self.email_manager.send_email_thread(
+            recipient, subject, body,
+            attachments,
+            on_success=on_success, on_error=on_error
+        )
 
     def get_dropdown_values(self) -> List[str]:
         # Helper to get formatted "Name (Price)" list
@@ -1231,6 +2051,26 @@ class POSSystem:
         ttk.Button(win, text="VIEW REJECTED PRODUCTS", command=show_rejected, style="Danger.TButton").pack(pady=15, ipadx=10)
         ttk.Button(win, text="OK", command=win.destroy).pack(pady=5, ipadx=20)
 
+    def check_restored_status(self):
+        if self.data_manager.config.get('restored_flag'):
+            try:
+                # Generate Yesterday's Summary
+                yesterday = datetime.datetime.now() - datetime.timedelta(days=1)
+                self.generate_daily_summary_on_close(target_date=yesterday)
+                
+                # Generate Today's BI (Beginning Inventory) - Now with email enabled to notify user after restore
+                self.generate_beginning_inventory_report(silent=False)
+                
+                # Clear flag
+                self.data_manager.config['restored_flag'] = False
+                self.data_manager.save_config()
+                
+                messagebox.showinfo("Post-Restore Synchronization", 
+                                    "A new Beginning Inventory (BI) report and yesterday's daily summary "
+                                    "have been successfully generated following the data restoration.")
+            except Exception as e:
+                messagebox.showerror("Error", f"Post-restore report generation failed: {e}")
+
     # --- INVENTORY TAB ---
     def setup_inventory_tab(self):
         self.tab_inventory.config(style="Inventory.TFrame")
@@ -1274,6 +2114,7 @@ class POSSystem:
         b = ttk.Frame(main_content, style="Inventory.TFrame")
         b.pack(fill="x", padx=5, pady=10)
         ttk.Button(b, text="COMMIT STOCK", command=self.commit_inv, style="Accent.TButton").pack(side="right", ipadx=10)
+        ttk.Button(b, text="Import from XLSX", command=self.import_stock_xlsx).pack(side="right", padx=5)
         ttk.Button(b, text="Clear", command=self.clear_inv).pack(side="right", padx=5)
         ttk.Button(b, text="Del Line", command=self.del_inv_line).pack(side="right", padx=5)
 
@@ -1322,15 +2163,13 @@ class POSSystem:
             x['new_stock'] = new_stock
             p_items.append(x)
 
-        success = self.report_manager.generate_grouped_pdf(
+        success = self.report_manager.generate_thermal_inventory_receipt(
             os.path.join(INVENTORY_FOLDER, fname),
-            "INVENTORY RECEIPT", date_str, p_items,
-            ["Item", "Price", "Qty Added", "New Stock"],
-            [1.0, 4.5, 5.5, 6.5], subtotal_indices=[2], is_inventory=True
+            "INVENTORY RECEIPT", date_str, p_items
         )
 
         if success:
-            self.data_manager.add_transaction("inventory", fname, self.inventory_cart, date_str)
+            self.data_manager.add_transaction("inventory", fname, self.inventory_cart, date_str, user=self.session_user)
             self.clear_inv()
             messagebox.showinfo("Success", f"Stock Added. Receipt: {fname}")
 
@@ -1369,7 +2208,7 @@ class POSSystem:
         scrollbar = ttk.Scrollbar(tree_frame)
         scrollbar.pack(side="right", fill="y")
 
-        self.pos_tree = ttk.Treeview(tree_frame, columns=("cat", "name", "price", "qty", "sub"),
+        self.pos_tree = ttk.Treeview(tree_frame, columns=("cat", "name", "price", "qty", "sub", "promo"),
                                      show="headings", yscrollcommand=scrollbar.set)
         scrollbar.config(command=self.pos_tree.yview)
 
@@ -1378,16 +2217,28 @@ class POSSystem:
         self.pos_tree.heading("price", text="Price")
         self.pos_tree.heading("qty", text="Qty")
         self.pos_tree.heading("sub", text="Sub")
-        self.pos_tree.column("cat", width=80)
+        self.pos_tree.heading("promo", text="")
+        self.pos_tree.column("cat", width=60)
+        self.pos_tree.column("name", width=250)
         self.pos_tree.column("price", width=60)
         self.pos_tree.column("qty", width=40)
         self.pos_tree.column("sub", width=70)
+        self.pos_tree.column("promo", width=35, anchor="center")
         self.pos_tree.pack(fill="both", expand=True)
+        self.pos_tree.bind("<ButtonRelease-1>", self.on_pos_tree_click)
+        self.pos_tree.tag_configure('variant', foreground='#555555')
 
         b = ttk.Frame(main_content)
         b.pack(fill="x", padx=5, pady=10)
-        self.lbl_pos_total = ttk.Label(b, text="Total: 0.00", font=("Segoe UI", 14, "bold"), foreground="#d32f2f")
-        self.lbl_pos_total.pack(side="left", padx=5)
+        
+        sums_frame = ttk.Frame(b)
+        sums_frame.pack(side="left")
+        
+        self.lbl_pos_total = ttk.Label(sums_frame, text="Total: 0.00", font=("Segoe UI", 14, "bold"), foreground="#d32f2f")
+        self.lbl_pos_total.pack(side="top", anchor="w")
+        
+        self.lbl_pos_discount = ttk.Label(sums_frame, text="Discount: 0.00", font=("Segoe UI", 10, "bold"), foreground="#2e7d32")
+        self.lbl_pos_discount.pack(side="top", anchor="w")
 
         ttk.Button(b, text="CHECKOUT", command=self.checkout, style="Accent.TButton").pack(side="right", ipadx=20)
         ttk.Button(b, text="Clear", command=self.clear_pos).pack(side="right", padx=5)
@@ -1399,9 +2250,153 @@ class POSSystem:
 
         _, name, _, _ = self.data_manager.get_product_details_by_str(sel)
         real_inv = self.data_manager.get_stock_level(name)
-        in_cart = sum(i['qty'] for i in self.sales_cart if i['name'] == name)
+        
+        # Count all occurrences of this base product (including variants)
+        in_cart = 0
+        for i in self.sales_cart:
+            if i.get('base_product') == name or i['name'] == name:
+                in_cart += i['qty']
 
         self.lbl_stock_avail.config(text=f"Stk: {int(real_inv - in_cart)}")
+
+    def on_pos_tree_click(self, event):
+        region = self.pos_tree.identify_region(event.x, event.y)
+        if region == "cell":
+            column = self.pos_tree.identify_column(event.x)
+            if column == "#6": # Promo Column
+                item_id = self.pos_tree.identify_row(event.y)
+                if item_id:
+                    self.show_promo_options(item_id)
+
+    def show_promo_options(self, item_id):
+        # Find index in sales_cart
+        item_vals = self.pos_tree.item(item_id, 'values')
+        name = item_vals[1].strip() # Might be indented
+        
+        tags = self.pos_tree.item(item_id, 'tags')
+        if not tags: return
+        cart_idx = -1
+        for t in tags:
+            if t.startswith('idx_'):
+                cart_idx = int(t.split('_')[1])
+                break
+        
+        if cart_idx == -1 or cart_idx >= len(self.sales_cart): return
+        
+        item = self.sales_cart[cart_idx]
+        
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=f"X% Discount", command=lambda: self.ask_discount_promo(cart_idx))
+        menu.add_command(label=f"Buy Y Take Z", command=lambda: self.ask_bytz_promo(cart_idx))
+        menu.add_separator()
+        menu.add_command(label="Remove Promo", command=lambda: self.remove_promo(cart_idx))
+        
+        # Position menu near cursor
+        menu.post(self.root.winfo_pointerx(), self.root.winfo_pointery())
+
+    def ask_discount_promo(self, idx):
+        item = self.sales_cart[idx]
+        if item.get('is_variant') and 'OFF)' not in item['name']:
+            messagebox.showwarning("Warning", "Cannot apply discount to this variant.")
+            return
+            
+        percent = simpledialog.askinteger("Discount", "Enter Discount Percentage (1-99):", minvalue=1, maxvalue=99, parent=self.root)
+        if percent is None: return
+        
+        orig_name = item.get('base_product', item['name'])
+        orig_price = item.get('orig_price', item['price'])
+        
+        new_price = orig_price * (1 - (percent / 100.0))
+        new_name = f"({percent}%OFF){orig_name}"
+        
+        # Update item
+        item['name'] = new_name
+        item['price'] = new_price
+        item['subtotal'] = new_price * item['qty']
+        item['is_variant'] = True
+        item['base_product'] = orig_name
+        item['orig_price'] = orig_price
+        
+        self.refresh_pos()
+
+    def ask_bytz_promo(self, idx):
+        item = self.sales_cart[idx]
+        # BYTZ logic requires knowing the total quantity of the base product
+        base_name = item.get('base_product', item['name'])
+        
+        y = simpledialog.askinteger("Buy Y", "Enter 'Y' (Buy Y):", minvalue=1, parent=self.root)
+        if y is None: return
+        z = simpledialog.askinteger("Take Z", "Enter 'Z' (Take Z):", minvalue=1, parent=self.root)
+        if z is None: return
+        
+        self.apply_bytz_logic(base_name, y, z)
+        self.refresh_pos()
+
+    def apply_bytz_logic(self, base_name, y, z):
+        # 1. Collect total qty of this base product
+        total_qty = 0
+        cat = "General"
+        orig_price = 0
+        
+        new_cart = []
+        for item in self.sales_cart:
+            if item.get('base_product', item['name']) == base_name:
+                total_qty += item['qty']
+                cat = item['category']
+                orig_price = item.get('orig_price', item['price'])
+            else:
+                new_cart.append(item)
+        
+        if total_qty == 0: return # Should not happen
+        
+        # 2. Calculate Split
+        set_size = y + z
+        num_sets = total_qty // set_size
+        remainder = total_qty % set_size
+        
+        free_qty = num_sets * z
+        paid_qty = (num_sets * y) + remainder
+        
+        # 3. Add items back to cart
+        if paid_qty > 0:
+            new_cart.append({
+                "code": "", "name": base_name, "price": orig_price, 
+                "qty": paid_qty, "subtotal": orig_price * paid_qty, 
+                "category": cat, "base_product": base_name, "orig_price": orig_price
+            })
+        
+        if free_qty > 0:
+            variant_name = f"(B{y}T{z}){base_name}"
+            new_cart.append({
+                "code": "", "name": variant_name, "price": 0.0, 
+                "qty": free_qty, "subtotal": 0.0, 
+                "category": cat, "is_variant": True, "base_product": base_name, "orig_price": orig_price
+            })
+            
+        self.sales_cart = new_cart
+
+    def remove_promo(self, idx):
+        item = self.sales_cart[idx]
+        base_name = item.get('base_product', item['name'])
+        orig_price = item.get('orig_price', item['price'])
+        cat = item['category']
+        
+        # Restore all items of this base product to normal
+        total_qty = 0
+        new_cart = []
+        for it in self.sales_cart:
+            if it.get('base_product', it['name']) == base_name:
+                total_qty += it['qty']
+            else:
+                new_cart.append(it)
+        
+        new_cart.append({
+            "code": "", "name": base_name, "price": orig_price, 
+            "qty": total_qty, "subtotal": orig_price * total_qty, 
+            "category": cat, "base_product": base_name, "orig_price": orig_price
+        })
+        self.sales_cart = new_cart
+        self.refresh_pos()
 
     def add_pos(self):
         sel, qty = self.pos_prod_var.get(), self.pos_qty_var.get()
@@ -1409,22 +2404,63 @@ class POSSystem:
         _, name, price, cat = self.data_manager.get_product_details_by_str(sel)
 
         real_inv = self.data_manager.get_stock_level(name)
-        cart_q = sum(i['qty'] for i in self.sales_cart if i['name'] == name)
+        
+        # Count all occurrences of this base product
+        cart_q = 0
+        for i in self.sales_cart:
+            if i.get('base_product', i['name']) == name:
+                cart_q += i['qty']
 
         if (cart_q + qty) > real_inv:
             messagebox.showerror("Stock", f"Low Stock!\nAvail: {int(real_inv)}")
             return
 
-        sub = price * qty
-        found = False
+        # Check if there's an existing BYTZ promo for this product
+        has_bytz = False
+        promo_params = (0, 0)
         for i in self.sales_cart:
-            if i['name'] == name:
-                i['qty'] += qty
-                i['subtotal'] += sub
-                found = True
-                break
-        if not found:
-            self.sales_cart.append({"code": "", "name": name, "price": price, "qty": qty, "subtotal": sub, "category": cat})
+            if i.get('base_product', i['name']) == name and i['name'].startswith('(B') and 'T' in i['name']:
+                # Extract Y and Z from name like (B1T1)...
+                import re
+                m = re.match(r'\(B(\d+)T(\d+)\)', i['name'])
+                if m:
+                    has_bytz = True
+                    promo_params = (int(m.group(1)), int(m.group(2)))
+                    break
+        
+        if has_bytz:
+            # Re-apply BYTZ logic after adding qty to total
+            # Find base product item (if exists) or add it
+            found = False
+            for i in self.sales_cart:
+                if i['name'] == name:
+                    i['qty'] += qty
+                    i['subtotal'] = i['price'] * i['qty']
+                    found = True
+                    break
+            if not found:
+                # Add temporary base item to be merged by BYTZ logic
+                self.sales_cart.append({
+                    "code": "", "name": name, "price": price, "qty": qty, 
+                    "subtotal": price * qty, "category": cat, 
+                    "base_product": name, "orig_price": price
+                })
+            self.apply_bytz_logic(name, promo_params[0], promo_params[1])
+        else:
+            # Normal add or merge into non-promo item
+            found = False
+            for i in self.sales_cart:
+                if i['name'] == name:
+                    i['qty'] += qty
+                    i['subtotal'] = i['price'] * i['qty']
+                    found = True
+                    break
+            if not found:
+                self.sales_cart.append({
+                    "code": "", "name": name, "price": price, "qty": qty, 
+                    "subtotal": price * qty, "category": cat, 
+                    "base_product": name, "orig_price": price
+                })
 
         self.refresh_pos()
         self.on_pos_sel(None)
@@ -1432,18 +2468,53 @@ class POSSystem:
     def refresh_pos(self):
         for i in self.pos_tree.get_children(): self.pos_tree.delete(i)
         tot = 0
-        for i in sorted(self.sales_cart, key=lambda x: (x['category'], x['name'])):
-            self.pos_tree.insert("", "end", values=(i['category'], i['name'], f"{i['price']:.2f}", i['qty'],
-                                                    f"{i['subtotal']:.2f}"))
+        total_discount = 0.0
+        
+        # Sorting logic: Variants follow parents
+        def get_sort_key(item):
+            base = item.get('base_product', item['name'])
+            cat = item['category']
+            is_var = item.get('is_variant', False)
+            return (cat, base, is_var, item['name'])
+            
+        sorted_cart = sorted(self.sales_cart, key=get_sort_key)
+        
+        for i in sorted_cart:
+            actual_idx = self.sales_cart.index(i)
+            
+            display_name = i['name']
+            tags = (f'idx_{actual_idx}',)
+            if i.get('is_variant'):
+                display_name = "  " + display_name
+                tags += ('variant',)
+                
+            orig_p = i.get('orig_price', i['price'])
+            disc = (orig_p - i['price']) * i['qty']
+            total_discount += disc
+            
+            self.pos_tree.insert("", "end", values=(i['category'], display_name, f"{i['price']:.2f}", i['qty'],
+                                                    f"{i['subtotal']:.2f}", "\u25BC"),
+                                 tags=tags)
             tot += i['subtotal']
-        self.lbl_pos_total.config(text=f"Total: {tot:.2f}")
+            
+        self.lbl_pos_total.config(text=f"Total Due: {tot:.2f}")
+        self.lbl_pos_discount.config(text=f"Total Discount: {total_discount:.2f}")
 
     def del_pos_line(self):
         if not self.pos_tree.selection(): return
-        name = self.pos_tree.item(self.pos_tree.selection()[0])['values'][1]
-        self.sales_cart = [i for i in self.sales_cart if str(i['name']) != str(name)]
-        self.refresh_pos()
-        self.on_pos_sel(None)
+        item_id = self.pos_tree.selection()[0]
+        tags = self.pos_tree.item(item_id, 'tags')
+        
+        cart_idx = -1
+        for t in tags:
+            if t.startswith('idx_'):
+                cart_idx = int(t.split('_')[1])
+                break
+                
+        if cart_idx != -1:
+            self.sales_cart.pop(cart_idx)
+            self.refresh_pos()
+            self.on_pos_sel(None)
 
     def clear_pos(self):
         self.sales_cart = []
@@ -1452,19 +2523,100 @@ class POSSystem:
 
     def checkout(self):
         if not self.sales_cart: return
+        
+        tot = sum([i['subtotal'] for i in self.sales_cart])
+        
+        # Calculate discount for display
+        total_discount = 0.0
+        for i in self.sales_cart:
+            orig_p = i.get('orig_price', i['price'])
+            total_discount += (orig_p - i['price']) * i['qty']
+        
+        # Payment Dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Checkout Payment")
+        dialog.geometry("350x300")
+        dialog.grab_set()
+        dialog.resizable(False, False)
+        
+        f = ttk.Frame(dialog, padding=20)
+        f.pack(fill="both", expand=True)
+        
+        if total_discount > 0:
+            ttk.Label(f, text=f"Discount Applied: {total_discount:.2f}", font=("Segoe UI", 10), foreground="#2e7d32").pack()
+            
+        ttk.Label(f, text=f"Total Due: {tot:.2f}", font=("Segoe UI", 16, "bold")).pack(pady=10)
+        
+        ttk.Label(f, text="Cash Tendered:", font=("Segoe UI", 12)).pack(pady=5)
+        cash_var = tk.StringVar()
+        cash_entry = ttk.Entry(f, textvariable=cash_var, font=("Segoe UI", 14), justify="center")
+        cash_entry.pack(pady=5)
+        cash_entry.focus_set()
+        
+        lbl_change = ttk.Label(f, text="Change: 0.00", font=("Segoe UI", 14, "bold"), foreground="green")
+        lbl_change.pack(pady=10)
+        
+        def update_change(*args):
+            try:
+                cash = float(cash_var.get())
+                change = cash - tot
+                if change >= 0:
+                    lbl_change.config(text=f"Change: {change:.2f}", foreground="green")
+                else:
+                    lbl_change.config(text=f"Change: {change:.2f}", foreground="red")
+            except ValueError:
+                lbl_change.config(text="Change: 0.00", foreground="green")
+                
+        cash_var.trace_add("write", update_change)
+        
+        def on_confirm(*args):
+            try:
+                cash = float(cash_var.get())
+            except ValueError:
+                messagebox.showerror("Error", "Please enter a valid cash amount.", parent=dialog)
+                return
+                
+            if cash < tot:
+                messagebox.showerror("Error", "Cash tendered is less than total amount.", parent=dialog)
+                return
+                
+            change = cash - tot
+            dialog.destroy()
+            self._finalize_checkout(cash, change)
+            
+        btn_frame = ttk.Frame(f)
+        btn_frame.pack(fill="both", expand=True, pady=10)
+        
+        # Use classic styling config to guarantee correct display. The 'Accent.TButton' will work with clam theme.
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side="left", expand=True, fill="x", padx=10, ipady=5)
+        ttk.Button(btn_frame, text="Confirm\n(Proceed)", style="Accent.TButton", command=on_confirm).pack(side="left", expand=True, fill="x", padx=10, ipady=5)
+
+        
+        dialog.bind('<Return>', on_confirm)
+        dialog.bind('<Escape>', lambda e: dialog.destroy())
+
+    def _finalize_checkout(self, cash_tendered: float, change: float):
         now = datetime.datetime.now()
         date_str = now.strftime('%Y-%m-%d %H:%M:%S')
         fname = f"{now.strftime('%Y%m%d-%H%M%S')}.pdf"
 
-        success = self.report_manager.generate_grouped_pdf(
+        # Calculate Total Discount for the transaction
+        total_discount = 0.0
+        for i in self.sales_cart:
+            orig_p = i.get('orig_price', i['price'])
+            total_discount += (orig_p - i['price']) * i['qty']
+
+        # Use new 57mm thermal receipt generator
+        success = self.report_manager.generate_thermal_sales_receipt(
             os.path.join(RECEIPT_FOLDER, fname),
             "SALES RECEIPT", date_str, self.sales_cart,
-            ["Item", "Price", "Qty", "Total"],
-            [1.0, 4.5, 5.5, 6.5], subtotal_indices=[2, 3]
+            cash_tendered, change, total_discount=total_discount
         )
 
         if success:
-            self.data_manager.add_transaction("sales", fname, self.sales_cart, date_str)
+            self.data_manager.add_transaction("sales", fname, self.sales_cart, date_str, 
+                                              cash_tendered=cash_tendered, change=change, 
+                                              total_discount=total_discount, user=self.session_user)
             self.clear_pos()
             messagebox.showinfo("Success", f"Saved: {fname}")
 
@@ -1497,6 +2649,15 @@ class POSSystem:
         self.lbl_corr_target = ttk.Label(frame_editor, text="No receipt selected", foreground="blue",
                                          font=("Segoe UI", 10, "bold"))
         self.lbl_corr_target.pack(padx=5, pady=5)
+
+        self.f_corr_cash = ttk.Frame(frame_editor)
+        self.f_corr_cash.pack(fill="x", padx=5, pady=2)
+        self.lbl_corr_cash = ttk.Label(self.f_corr_cash, text="Cash Tendered: N/A", font=("Segoe UI", 9))
+        self.lbl_corr_cash.pack(side="left")
+        self.btn_corr_cash = ttk.Button(self.f_corr_cash, text="Edit Cash", command=self.ask_correction_cash, state="disabled")
+        self.btn_corr_cash.pack(side="left", padx=10)
+        self.correction_cash_tendered = None
+
 
         self.corr_edit_tree = ttk.Treeview(frame_editor, columns=("name", "qty_orig", "qty_adj"), show="headings")
         self.corr_edit_tree.heading("name", text="Product")
@@ -1534,6 +2695,17 @@ class POSSystem:
         self.selected_transaction = json.loads(trans_str)
         self.lbl_corr_target.config(text=f"Editing: {self.selected_transaction['filename']}")
 
+        if self.selected_transaction.get('type') == 'sales':
+            cash = self.selected_transaction.get('cash_tendered', 0.0)
+            self.correction_cash_tendered = cash
+            self.lbl_corr_cash.config(text=f"Cash Tendered: {cash:.2f}")
+            self.btn_corr_cash.config(state="normal")
+        else:
+            self.correction_cash_tendered = None
+            self.lbl_corr_cash.config(text="Cash Tendered: N/A")
+            self.btn_corr_cash.config(state="disabled")
+
+
         for i in self.corr_edit_tree.get_children(): self.corr_edit_tree.delete(i)
         self.correction_cart = []
         for item in self.selected_transaction.get('items', []):
@@ -1555,6 +2727,13 @@ class POSSystem:
         if new_val is not None:
             self.correction_cart[idx]['adjustment'] = new_val
             self.corr_edit_tree.item(sel[0], values=(item['name'], item['qty'], new_val))
+
+    def ask_correction_cash(self):
+        if self.correction_cash_tendered is None: return
+        new_val = simpledialog.askfloat("Correction", "Enter New Cash Tendered Amount:", initialvalue=self.correction_cash_tendered, parent=self.root)
+        if new_val is not None:
+            self.correction_cash_tendered = new_val
+            self.lbl_corr_cash.config(text=f"Cash Tendered: {new_val:.2f} (Modified)")
 
     def finalize_correction(self):
         if not self.selected_transaction: return
@@ -1585,21 +2764,244 @@ class POSSystem:
                 ledger_item['qty'] = adj
                 ledger_adjustment_items.append(ledger_item)
 
+        extra = f"Ref: {ref_file}"
+        if self.selected_transaction['type'] == 'sales' and self.correction_cash_tendered is not None:
+            extra += f" | New Cash: {self.correction_cash_tendered:.2f}"
+
         success = self.report_manager.generate_grouped_pdf(
             os.path.join(CORRECTION_FOLDER, fname),
             "CORRECTION RECEIPT", date_str, pdf_items,
             ["Item", "Orig", "Adj", "Final"],
-            [1.0, 4.5, 5.5, 6.5], is_summary=False, extra_info=f"Ref: {ref_file}"
+            [1.0, 4.5, 5.5, 6.5], is_summary=False, extra_info=extra
         )
 
         if success:
+            kwargs = {}
+            if self.selected_transaction['type'] == 'sales':
+                # Calculate adjusted total
+                orig_total = sum(i['price'] * i['qty'] for i in self.selected_transaction.get('items', []))
+                adj_total = sum(i['price'] * i['adjustment'] for i in self.correction_cart)
+                new_total = orig_total + adj_total
+                
+                new_cash = self.correction_cash_tendered if self.correction_cash_tendered is not None else self.selected_transaction.get('cash_tendered', 0.0)
+                new_change = new_cash - new_total
+                
+                kwargs['cash_tendered'] = new_cash
+                kwargs['change'] = new_change
+                
             self.data_manager.add_transaction("correction", fname, ledger_adjustment_items,
-                                              date_str, self.selected_transaction['type'], ref_file)
+                                              date_str, self.selected_transaction['type'], ref_file, user=self.session_user, **kwargs)
 
             for i in self.corr_edit_tree.get_children(): self.corr_edit_tree.delete(i)
             self.lbl_corr_target.config(text="No receipt selected")
             self.selected_transaction = None
             messagebox.showinfo("Success", f"Correction Saved: {fname}")
+
+    # --- RECEIPTS TAB ---
+    def setup_receipts_tab(self):
+        paned = ttk.PanedWindow(self.tab_receipts, orient="horizontal")
+        paned.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Left panel: Date & Filter
+        left_frame = ttk.LabelFrame(paned, text="Search Receipts")
+        paned.add(left_frame, weight=1)
+
+        filter_row = ttk.Frame(left_frame)
+        filter_row.pack(fill="x", padx=5, pady=5)
+        
+        self.rec_chk_custom_date_var = tk.BooleanVar(value=False)
+        self.rec_chk_custom_date = ttk.Checkbutton(filter_row, text="Specific Date", variable=self.rec_chk_custom_date_var, command=self.toggle_rec_custom_date)
+        self.rec_chk_custom_date.pack(side="left", padx=5)
+
+        self.rec_frame_custom_date = ttk.Frame(filter_row)
+        self.rec_frame_custom_date.pack(side="left")
+
+        current_year = datetime.datetime.now().year
+        self.rec_cmb_year = ttk.Combobox(self.rec_frame_custom_date, values=[y for y in range(current_year - 5, current_year + 2)], width=5, state="disabled")
+        self.rec_cmb_year.set(current_year)
+        self.rec_cmb_year.pack(side="left", padx=1)
+
+        self.rec_cmb_month = ttk.Combobox(self.rec_frame_custom_date, values=[str(m).zfill(2) for m in range(1, 13)], width=3, state="disabled")
+        self.rec_cmb_month.set(str(datetime.datetime.now().month).zfill(2))
+        self.rec_cmb_month.pack(side="left", padx=1)
+
+        self.rec_cmb_day = ttk.Combobox(self.rec_frame_custom_date, values=[str(d).zfill(2) for d in range(1, 32)], width=3, state="disabled")
+        self.rec_cmb_day.set(str(datetime.datetime.now().day).zfill(2))
+        self.rec_cmb_day.pack(side="left", padx=1)
+
+        ttk.Label(left_frame, text="Type:").pack(anchor="w", padx=5, pady=(5,0))
+        self.rec_type_var = tk.StringVar(value="All")
+        ttk.OptionMenu(left_frame, self.rec_type_var, "All", "All", "sales", "inventory", "correction").pack(anchor="w", padx=5)
+        
+        ttk.Button(left_frame, text="Refresh", command=self.refresh_receipts_list).pack(pady=5, padx=5, anchor="w")
+
+        self.rec_list_tree = ttk.Treeview(left_frame, columns=("time", "type", "file"), show="headings")
+        self.rec_list_tree.heading("time", text="Time")
+        self.rec_list_tree.heading("type", text="Type")
+        self.rec_list_tree.heading("file", text="Filename")
+        self.rec_list_tree.column("time", width=80)
+        self.rec_list_tree.column("type", width=80)
+        self.rec_list_tree.column("file", width=180)
+        
+        rec_scrollbar = ttk.Scrollbar(left_frame, orient="vertical", command=self.rec_list_tree.yview)
+        self.rec_list_tree.configure(yscrollcommand=rec_scrollbar.set)
+        
+        rec_scrollbar.pack(side="right", fill="y")
+        self.rec_list_tree.pack(fill="both", expand=True, padx=5, pady=5)
+        self.rec_list_tree.bind("<<TreeviewSelect>>", self.on_receipt_select)
+
+        # Right panel: Preview
+        right_frame = ttk.LabelFrame(paned, text="Receipt Preview")
+        paned.add(right_frame, weight=2)
+        
+        self.rec_preview_text = tk.Text(right_frame, font=("Courier New", 10), state="disabled", wrap="none")
+        ysb = ttk.Scrollbar(right_frame, orient="vertical", command=self.rec_preview_text.yview)
+        xsb = ttk.Scrollbar(right_frame, orient="horizontal", command=self.rec_preview_text.xview)
+        self.rec_preview_text.configure(yscrollcommand=ysb.set, xscrollcommand=xsb.set)
+        
+        ysb.pack(side="right", fill="y")
+        xsb.pack(side="bottom", fill="x")
+        self.rec_preview_text.pack(fill="both", expand=True, padx=5, pady=5)
+        
+    def toggle_rec_custom_date(self):
+        state = "readonly" if self.rec_chk_custom_date_var.get() else "disabled"
+        self.rec_cmb_year.config(state=state)
+        self.rec_cmb_month.config(state=state)
+        self.rec_cmb_day.config(state=state)
+        
+    def refresh_receipts_list(self):
+        for i in self.rec_list_tree.get_children(): self.rec_list_tree.delete(i)
+        
+        if self.rec_chk_custom_date_var.get():
+            try:
+                y = int(self.rec_cmb_year.get())
+                m = int(self.rec_cmb_month.get())
+                d = int(self.rec_cmb_day.get())
+                target_date = datetime.datetime(y, m, d).strftime("%Y-%m-%d")
+            except ValueError:
+                target_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        else:
+            target_date = datetime.datetime.now().strftime("%Y-%m-%d")
+            
+        target_type = self.rec_type_var.get().lower()
+        
+        for trans in self.data_manager.ledger:
+            t_type = trans.get('type', '')
+            if target_type != 'all' and t_type != target_type: continue
+            
+            ts = trans.get('timestamp', '')
+            if ts.startswith(target_date):
+                time_part = ts.split(' ')[1] if ' ' in ts else ts
+                self.rec_list_tree.insert("", "end", values=(time_part, t_type.capitalize(), trans.get('filename')), tags=(json.dumps(trans),))
+                
+    def on_receipt_select(self, event):
+        sel = self.rec_list_tree.selection()
+        if not sel: return
+        
+        trans_str = self.rec_list_tree.item(sel[0], 'tags')[0]
+        trans = json.loads(trans_str)
+        
+        self.rec_preview_text.config(state="normal")
+        self.rec_preview_text.delete("1.0", tk.END)
+        
+        # Build text preview mimicking 57mm thermal receipt
+        width = 40  # 40 chars config based approximately on 57mm formatting in courier
+        
+        lines = []
+        def add_centered(text): lines.append(text.center(width))
+        def add_left_right(left, right): 
+            space = width - len(left) - len(right)
+            if space < 1: space = 1
+            lines.append(left + " " * space + right)
+        def add_divider(): lines.append("-" * width)
+        
+        add_centered(str(self.data_manager.business_name))
+        add_centered(APP_TITLE)
+        
+        t_type = trans.get('type', '')
+        if t_type == 'sales': add_centered("SALES RECEIPT")
+        elif t_type == 'inventory': add_centered("INVENTORY RECEIPT")
+        elif t_type == 'correction': add_centered("CORRECTION RECEIPT")
+        else: add_centered("RECEIPT")
+        
+        lines.append("")
+        lines.append(f"Date: {trans.get('timestamp', '')}")
+        lines.append(f"File: {trans.get('filename', '')}")
+        if t_type == 'correction':
+            lines.append(f"Ref:  {trans.get('ref_filename', '')}")
+            
+        add_divider()
+        
+        if t_type == 'inventory':
+            add_left_right("ITEM", "NEW STK")
+        else:
+            add_left_right("ITEM", "TOTAL")
+            
+        add_divider()
+        
+        total_amt = 0.0
+        total_qty = 0
+        total_added = 0
+        
+        for item in trans.get('items', []):
+            name = str(item.get('name', 'Unknown'))
+            if self.data_manager and name in self.data_manager.display_name_map:
+                name = str(self.data_manager.display_name_map[name])
+                
+            if len(name) > 25:
+                d_s = str(name)
+                name = d_s[:12] + "..." + d_s[-10:]
+                
+            qty = float(item.get('qty', 0))
+            price = float(item.get('price', 0.0))
+            
+            lines.append(name)
+            
+            if t_type == 'inventory':
+                new_stock = float(item.get('new_stock', 0))
+                add_left_right(f"  Added: {int(qty)}", str(int(new_stock)))
+                total_added += int(qty)
+            elif t_type == 'correction':
+                orig = float(item.get('qty_orig', 0))
+                adj = float(item.get('qty', 0))
+                add_left_right(f"  Adj: {int(adj):+d}  Price: {price:.2f}", "")
+            else:
+                subtotal = float(item.get('subtotal', price * qty))
+                add_left_right(f"  {int(qty)} x {price:.2f}", f"{subtotal:.2f}")
+                total_amt += subtotal
+                total_qty += int(qty)
+                
+        add_divider()
+        
+        if t_type == 'inventory':
+            add_left_right("TOTAL ADDED:", str(int(total_added)))
+        elif t_type == 'sales':
+            total_discount = trans.get('total_discount', 0.0)
+            if total_discount > 0:
+                add_left_right("TOTAL DISCOUNT:", f"{total_discount:.2f}")
+            add_left_right("TOTAL DUE:", f"{total_amt:.2f}")
+            cash = trans.get('cash_tendered', 0.0)
+            change = trans.get('change', 0.0)
+            
+            if cash > 0 or change != 0:
+                add_left_right("CASH TENDERED:", f"{cash:.2f}")
+                add_left_right("CHANGE:", f"{change:.2f}")
+            
+            lines.append("")
+            lines.append(f"Total Items: {int(total_qty)}")
+            
+        elif t_type == 'correction':
+            # Check if there is cash modifications
+            if trans.get('ref_type') == 'sales':
+                if 'cash_tendered' in trans and 'change' in trans:
+                    add_left_right("NEW CASH:", f"{trans.get('cash_tendered', 0.0):.2f}")
+                    add_left_right("NEW CHANGE:", f"{trans.get('change', 0.0):.2f}")
+                    
+        lines.append("")
+        add_centered("*** END OF RECEIPT ***")
+        
+        self.rec_preview_text.insert(tk.END, "\n".join(lines))
+        self.rec_preview_text.config(state="disabled")
 
     # --- SUMMARY TAB ---
     def setup_summary_tab(self):
@@ -1607,8 +3009,8 @@ class POSSystem:
         f.pack(fill="x", padx=5, pady=5)
 
         ttk.Label(f, text="Period:").pack(side="left")
-        self.report_type = tk.StringVar(value="All Time")
-        ttk.OptionMenu(f, self.report_type, "All Time", "Daily", "Weekly", "Monthly", "All Time").pack(side="left", padx=5)
+        self.report_type = tk.StringVar(value="Daily")
+        ttk.OptionMenu(f, self.report_type, "Daily", "Daily", "Weekly", "Monthly", "All Time", command=self.on_report_type_change).pack(side="left", padx=5)
 
         self.chk_custom_date_var = tk.BooleanVar(value=False)
         self.chk_custom_date = ttk.Checkbutton(f, text="OTHER DATE", variable=self.chk_custom_date_var,
@@ -1636,8 +3038,18 @@ class POSSystem:
         self.cmb_day.pack(side="left", padx=1)
 
         ttk.Button(f, text="Refresh View", command=self.gen_view).pack(side="left", padx=10)
-        ttk.Button(f, text="Gen PDF", command=self.gen_pdf).pack(side="left", padx=5)
+        self.btn_gen_pdf = ttk.Button(f, text="Gen PDF", command=self.gen_pdf)
+        self.btn_gen_pdf.pack(side="left", padx=5)
 
+        opt_f = ttk.Frame(self.tab_summary)
+        opt_f.pack(fill="x", padx=5, pady=0)
+        
+        self.chk_items_per_trans_var = tk.BooleanVar(value=False)
+        self.chk_items_per_trans = ttk.Checkbutton(opt_f, text="View as Items per Transaction (Daily Only)", variable=self.chk_items_per_trans_var, command=self.gen_view)
+        self.chk_items_per_trans.pack(side="left", padx=5)
+        # It defaults to normal since report_type is Daily
+        self.chk_items_per_trans.config(state="normal")
+        
         tree_frame = ttk.Frame(self.tab_summary)
         tree_frame.pack(fill="both", expand=True, padx=5, pady=5)
         scrollbar = ttk.Scrollbar(tree_frame)
@@ -1653,10 +3065,45 @@ class POSSystem:
         self.sum_tree.heading("out", text="Out")
         self.sum_tree.heading("rem", text="Stk")
         self.sum_tree.heading("sale", text="Sales")
-        for col in ["in", "out", "rem", "price"]: self.sum_tree.column(col, width=50)
+        
+        self.sum_tree.column("cat", width=60)
+        self.sum_tree.column("name", width=200)
+        self.sum_tree.column("price", width=50)
+        for col in ["in", "out", "rem"]: self.sum_tree.column(col, width=40)
+        self.sum_tree.column("sale", width=60)
+        
         self.sum_tree.pack(fill="both", expand=True)
-        self.lbl_sum_info = ttk.Label(self.tab_summary, text="Ready")
-        self.lbl_sum_info.pack(pady=2)
+        
+        # Add Treeview style tags for the summary tree
+        self.sum_tree.tag_configure('parent', background='#e0e0e0', font=('Helvetica', 9, 'bold'))
+        self.sum_tree.tag_configure('info', foreground='#555555')
+        
+        bottom_f = ttk.Frame(self.tab_summary)
+        bottom_f.pack(fill="x", padx=5, pady=2)
+        
+        self.lbl_sum_info = ttk.Label(bottom_f, text="Ready", font=("Segoe UI", 10, "bold"))
+        self.lbl_sum_info.pack(side="left")
+        
+        self.lbl_sum_discount = ttk.Label(bottom_f, text="", font=("Segoe UI", 9, "bold"), foreground="#CC6600")
+        self.lbl_sum_discount.pack(side="right", padx=10)
+        
+        self.lbl_sum_change = ttk.Label(bottom_f, text="", font=("Segoe UI", 9, "bold"), foreground="green")
+        self.lbl_sum_change.pack(side="right", padx=10)
+        
+        self.lbl_sum_cash = ttk.Label(bottom_f, text="", font=("Segoe UI", 9, "bold"), foreground="blue")
+        self.lbl_sum_cash.pack(side="right", padx=10)
+
+    def on_report_type_change(self, *args):
+        if self.report_type.get() == "Daily":
+            self.chk_items_per_trans.config(state="normal")
+            if hasattr(self, 'btn_gen_pdf'):
+                self.btn_gen_pdf.config(state="normal")
+        else:
+            self.chk_items_per_trans_var.set(False)
+            self.chk_items_per_trans.config(state="disabled")
+            if hasattr(self, 'btn_gen_pdf'):
+                self.btn_gen_pdf.config(state="disabled")
+        self.gen_view()
 
     def toggle_custom_date(self):
         state = "readonly" if self.chk_custom_date_var.get() else "disabled"
@@ -1708,26 +3155,26 @@ class POSSystem:
             p_data = period_stats.get(name, {'in': 0, 'out': 0, 'sales_lines': [], 'in_lines': []})
 
             price_map = {}
-            # Aggregate by price point
+            # Aggregate by variant name and price point
             for line in p_data['sales_lines']:
-                p = line['price']
-                if p not in price_map: price_map[p] = {'in': 0, 'out': 0, 'sales': 0}
-                price_map[p]['out'] += line['qty']
-                price_map[p]['sales'] += line['amt']
+                line_name = line.get('name', name)
+                key = (line_name, line['price'])
+                if key not in price_map: price_map[key] = {'in': 0, 'out': 0, 'sales': 0}
+                price_map[key]['out'] += line['qty']
+                price_map[key]['sales'] += line['amt']
             for line in p_data['in_lines']:
-                p = line['price']
-                if p not in price_map: price_map[p] = {'in': 0, 'out': 0, 'sales': 0}
-                price_map[p]['in'] += line['qty']
+                line_name = line.get('name', name)
+                key = (line_name, line['price'])
+                if key not in price_map: price_map[key] = {'in': 0, 'out': 0, 'sales': 0}
+                price_map[key]['in'] += line['qty']
 
-            if not price_map: price_map[curr_price] = {'in': 0, 'out': 0, 'sales': 0}
+            if not price_map: price_map[(name, curr_price)] = {'in': 0, 'out': 0, 'sales': 0}
 
-            for price, data in price_map.items():
-                show_rem = rem_stock if price == curr_price else 0
+            for (variant_name, price), data in price_map.items():
+                is_variant = variant_name != name
+                show_rem = rem_stock if price == curr_price and not is_variant else 0
 
                 # Filter Logic
-                # If using override_period (catchup), we behave like a specific period report (hide zeros)
-                # If UI selected "All Time", we show everything including zero movement items if they exist in inventory
-
                 is_all_time = (self.report_type.get() == "All Time") and (override_period is None)
 
                 if not is_all_time:
@@ -1736,17 +3183,30 @@ class POSSystem:
                         self.data_manager.products_df['Product Name']):
                     continue
 
-                if cat == "Phased Out" and name in global_stats: name = global_stats[name]['name'] + " (Old)"
+                if cat == "Phased Out" and name in global_stats: 
+                    variant_name = global_stats[name]['name'] + " (Old)"
+                    if is_variant:
+                        variant_name = "  " + variant_name
+                elif is_variant:
+                    variant_name = "  " + variant_name
 
                 rows.append({
-                    'code': "", 'category': cat, 'name': name, 'price': price,
-                    'in': data['in'], 'out': data['out'], 'remaining': show_rem, 'sales': data['sales']
+                    'code': "", 'category': cat, 'name': variant_name, 'price': price,
+                    'in': data['in'], 'out': data['out'], 'remaining': show_rem, 'sales': data['sales'],
+                    'base_name': name, 'is_variant': is_variant
                 })
 
         final_rows = []
         names_in_excel = set(self.data_manager.products_df['Product Name'].astype(str))
+        def sort_rows(r):
+            cat = r['category']
+            base = r['base_name']
+            is_var = r['is_variant']
+            return (cat, base, is_var, r['name'])
+
+        rows = sorted(rows, key=sort_rows)
         for r in rows:
-            is_active = (r['in'] > 0 or r['out'] > 0 or r['remaining'] > 0 or r['name'] in names_in_excel)
+            is_active = (r['in'] > 0 or r['out'] > 0 or r['remaining'] > 0 or r['base_name'] in names_in_excel)
             if is_active: final_rows.append(r)
 
         return final_rows, in_c, out_c, corr_list
@@ -1755,43 +3215,245 @@ class POSSystem:
         data, in_c, out_c, corr_list = self.get_sum_data(override_period)
         for i in self.sum_tree.get_children(): self.sum_tree.delete(i)
 
-        def sort_key(x):
-            cat = x['category']
-            if cat == "Phased Out": cat = "zzz_Phased Out"
-            return (cat, x['name'])
-
-        data = sorted(data, key=sort_key)
-        tot = 0
-        for s in data:
-            self.sum_tree.insert("", "end",
-                                 values=(s['category'], s['name'], f"{s['price']:.2f}", int(s['in']), int(s['out']),
-                                         int(s['remaining']), f"{s['sales']:.2f}"))
-            tot += s['sales']
-
         p_txt = self.report_type.get()
+        is_daily = (p_txt == "Daily") and (override_period is None)
+        
         if p_txt != "All Time":
-            s, e = override_period if override_period else self.get_period_dates()
-            if s and e:
-                p_txt = f"{s.strftime('%m-%d')} to {e.strftime('%m-%d')}"
+            period = override_period if override_period else self.get_period_dates()
+            if period:
+                s, e = period
+                if s.date() == e.date():
+                    p_txt = s.strftime("%a, %d %b %y")
+                else:
+                    p_txt = f"{s.strftime('%a, %d %b %y')} to {e.strftime('%a, %d %b %y')}"
+        else:
+            period = None
+
+        tot = 0
+        total_cash = 0.0
+        total_change = 0.0
+        per_trans = []
+
+        if is_daily and period:
+            start_dt, end_dt = period
+            sales_cash = {}
+            # Scan ledger to calculate exact cash and get items-per-trans
+            for trans in self.data_manager.ledger:
+                try:
+                    ts = datetime.datetime.strptime(trans.get('timestamp', ''), "%Y-%m-%d %H:%M:%S")
+                    if start_dt <= ts <= end_dt:
+                        t_type = trans.get('type')
+                        fname = trans.get('filename')
+                        
+                        if t_type == 'sales':
+                            cash_tnd = float(trans.get('cash_tendered', 0.0))
+                            change_amt = float(trans.get('change', 0.0))
+                            total_disc = float(trans.get('total_discount', 0.0))
+                            sales_cash[fname] = {'cash': cash_tnd, 'change': change_amt, 'total_discount': total_disc}
+                            
+                            time_str = ts.strftime("%I:%M %p")
+                            items = []
+                            trans_subtot = 0.0
+                            
+                            for item in trans.get('items', []):
+                                name = item.get('name', '')
+                                if name in self.data_manager.display_name_map:
+                                    name = self.data_manager.display_name_map[name]
+                                price = float(item.get('price', 0.0))
+                                qty = int(item.get('qty', 0))
+                                subtotal = float(item.get('subtotal', price * qty))
+                                trans_subtot += subtotal
+                                
+                                is_variant = item.get('is_variant') or name.startswith('(')
+                                
+                                items.append({
+                                    'name': name,
+                                    'price': price,
+                                    'qty': qty,
+                                    'subtotal': subtotal,
+                                    'is_variant': is_variant
+                                })
+                            
+                            per_trans.append({
+                                'type': 'sales',
+                                'time': time_str,
+                                'filename': fname,
+                                'subtotal': trans_subtot,
+                                'cash': cash_tnd,
+                                'change': change_amt,
+                                'total_discount': total_disc,
+                                'items': items
+                            })
+                            
+                        elif t_type == 'inventory':
+                            time_str = ts.strftime("%I:%M %p")
+                            items = []
+                            trans_qty = 0
+                            
+                            for item in trans.get('items', []):
+                                name = item.get('name', '')
+                                if name in self.data_manager.display_name_map:
+                                    name = self.data_manager.display_name_map[name]
+                                qty = int(item.get('qty', 0))
+                                trans_qty += qty
+                                
+                                items.append({
+                                    'name': name,
+                                    'qty': qty
+                                })
+                                
+                            per_trans.append({
+                                'type': 'inventory',
+                                'time': time_str,
+                                'filename': fname,
+                                'total_qty': trans_qty,
+                                'items': items
+                            })
+                            
+                        elif t_type == 'correction' and trans.get('ref_type') == 'sales':
+                            ref = trans.get('ref_filename')
+                            if ref in sales_cash:
+                                if 'cash_tendered' in trans and 'change' in trans:
+                                    sales_cash[ref]['cash'] = float(trans.get('cash_tendered', 0.0))
+                                    sales_cash[ref]['change'] = float(trans.get('change', 0.0))
+                                    if 'total_discount' in trans:
+                                        sales_cash[ref]['total_discount'] = float(trans.get('total_discount', 0.0))
+                                    # Also update the per_trans entry
+                                    for pt in per_trans:
+                                        if pt.get('filename') == ref:
+                                            pt['cash'] = sales_cash[ref]['cash']
+                                            pt['change'] = sales_cash[ref]['change']
+                                            if 'total_discount' in sales_cash[ref]:
+                                                pt['total_discount'] = sales_cash[ref]['total_discount']
+                                            break
+                except ValueError:
+                    pass
+
+            total_cash = sum(x['cash'] for x in sales_cash.values())
+            total_change = sum(x['change'] for x in sales_cash.values())
+
+        if self.chk_items_per_trans_var.get() and is_daily:
+            self.sum_tree.heading("cat", text="Time")
+            self.sum_tree.heading("name", text="Transaction / Item")
+            self.sum_tree.heading("price", text="Price")
+            self.sum_tree.heading("in", text="-")
+            self.sum_tree.heading("out", text="Qty")
+            self.sum_tree.heading("rem", text="-")
+            self.sum_tree.heading("sale", text="Subtot")
+            
+            for pt in per_trans:
+                if pt['type'] == 'sales':
+                    # Parent Node for Sales Receipt
+                    header_text = f"SALES - {pt['filename']}"
+                    parent_id = self.sum_tree.insert("", "end",
+                                         values=(pt['time'], header_text, "", "", "", "", f"{pt['subtotal']:.2f}"),
+                                         tags=('parent',))
+                    
+                    # Child Nodes for Items
+                    for item in pt['items']:
+                        indent = "    " if item.get('is_variant') else "  "
+                        self.sum_tree.insert(parent_id, "end",
+                                             values=("", f"{indent}{item['name']}", f"{item['price']:.2f}", "", str(item['qty']), "", f"{item['subtotal']:.2f}"))
+                    
+                    # Show Transaction Discount
+                    if pt.get('total_discount', 0) > 0:
+                        self.sum_tree.insert(parent_id, "end",
+                                             values=("", "  TOTAL DISCOUNT", "", "", "", "", f"{pt['total_discount']:.2f}"), tags=('info',))
+                                             
+                    # Show Transaction Subtotal
+                    self.sum_tree.insert(parent_id, "end",
+                                         values=("", "  TOTAL DUE", "", "", "", "", f"{pt['subtotal']:.2f}"), tags=('info',))
+
+                    # Child Nodes for Cash/Change
+                    if pt['cash'] > 0 or pt['change'] > 0:
+                        self.sum_tree.insert(parent_id, "end",
+                                             values=("", "  CASH TENDERED", "", "", "", "", f"{pt['cash']:.2f}"), tags=('info',))
+                        self.sum_tree.insert(parent_id, "end",
+                                             values=("", "  CHANGE", "", "", "", "", f"{pt['change']:.2f}"), tags=('info',))
+                    
+                    tot += pt['subtotal']
+                
+                elif pt['type'] == 'inventory':
+                    # Parent Node for Inventory Receipt
+                    header_text = f"INVENTORY - {pt['filename']}"
+                    parent_id = self.sum_tree.insert("", "end",
+                                         values=(pt['time'], header_text, "", "", str(pt['total_qty']), "", ""),
+                                         tags=('parent',))
+                    
+                    # Child Nodes for Items
+                    for item in pt['items']:
+                        self.sum_tree.insert(parent_id, "end",
+                                             values=("", f"  {item['name']}", "", "", str(item['qty']), "", ""))
+        else:
+            self.sum_tree.heading("cat", text="Cat")
+            self.sum_tree.heading("name", text="Product")
+            self.sum_tree.heading("price", text="Price")
+            self.sum_tree.heading("in", text="In")
+            self.sum_tree.heading("out", text="Out")
+            self.sum_tree.heading("rem", text="Stk")
+            self.sum_tree.heading("sale", text="Sales")
+            
+            def sort_key(x):
+                cat = x['category']
+                if cat == "Phased Out": cat = "zzz_Phased Out"
+                return (cat, x.get('base_name', x['name']), x.get('is_variant', False), x['name'])
+
+            data = sorted(data, key=sort_key)
+            for s in data:
+                rem_val = int(s['remaining']) if s['remaining'] > 0 else ""
+                if s.get('is_variant', False):
+                    rem_val = ""
+                
+                self.sum_tree.insert("", "end",
+                                     values=(s['category'], s['name'], f"{s['price']:.2f}", int(s['in']), int(s['out']),
+                                             rem_val, f"{s['sales']:.2f}"))
+                tot += s['sales']
+
         self.lbl_sum_info.config(text=f"Period: {p_txt} | Sales: {tot:.2f}")
-        return data, tot, p_txt, in_c, out_c, corr_list
+        
+        # Calculate total discount for the period
+        total_discount_period = 0.0
+        for d_row in data:
+            if d_row.get('is_variant', False):
+                orig_price = d_row.get('orig_price', d_row.get('price', 0))
+                total_discount_period += (orig_price - d_row.get('price', 0)) * d_row.get('out', 0)
+        # Also sum from per_trans which is more reliable
+        if per_trans:
+            total_discount_period = sum(pt.get('total_discount', 0.0) for pt in per_trans if pt.get('type') == 'sales')
+        
+        if is_daily:
+            self.lbl_sum_cash.config(text=f"Total Cash Tendered: {total_cash:,.2f}")
+            self.lbl_sum_change.config(text=f"Total Change: {total_change:,.2f}")
+            if total_discount_period > 0:
+                self.lbl_sum_discount.config(text=f"Total Discount: {total_discount_period:,.2f}")
+            else:
+                self.lbl_sum_discount.config(text="")
+        else:
+            self.lbl_sum_cash.config(text="")
+            self.lbl_sum_change.config(text="")
+            self.lbl_sum_discount.config(text="")
+            
+        self.current_aggregated = data
+        self.current_per_trans = per_trans
+            
+        return data, tot, p_txt, in_c, out_c, corr_list, is_daily, total_cash, total_change, per_trans
 
     def gen_pdf(self):
         is_custom_date = self.chk_custom_date_var.get()
-        data, tot, p_txt, in_c, out_c, corr_list = self.gen_view()
+        data, tot, p_txt, in_c, out_c, corr_list, is_daily, total_cash, total_change, per_trans = self.gen_view()
         now = datetime.datetime.now()
 
         prefix = "History" if is_custom_date else "Summary"
         fname = f"{prefix}-{now.strftime('%Y%m%d-%H%M%S')}.pdf"
         full_path = os.path.join(SUMMARY_FOLDER, fname)
 
-        success = self.report_manager.generate_grouped_pdf(
-            full_path, "INVENTORY & SALES SUMMARY",
-            now.strftime('%Y-%m-%d %H:%M:%S'), data,
-            ["Product", "Price", "Added", "Sold", "Stock", "Sales"],
-            [1.0, 4.5, 5.2, 5.9, 6.6, 7.3], is_summary=True,
-            extra_info=f"Period: {p_txt} | In: {in_c} | Out: {out_c}",
-            subtotal_indices=[2, 3, 5], correction_list=corr_list
+        is_per_trans = self.chk_items_per_trans_var.get() and is_daily
+        title = "DAILY SUMMARY" if is_daily else "INVENTORY & SALES SUMMARY"
+
+        success = self.report_manager.generate_thermal_summary_receipt(
+            full_path, title, now.strftime('%Y-%m-%d %H:%M:%S'), p_txt,
+            self.current_aggregated, self.current_per_trans, is_per_trans,
+            tot, total_cash, total_change, in_c, out_c, corr_list
         )
 
         if success:
@@ -1799,41 +3461,137 @@ class POSSystem:
                 self.data_manager.summary_count += 1
                 self.data_manager.save_ledger()
 
-                recipient = self.data_manager.config.get("recipient_email", "").strip()
-                if recipient:
-                    extra_attachments = []
-
-                    # CATCHUP LOGIC
-                    catchup_start = self.get_catchup_start_time()
-                    if catchup_start:
-                        catchup_intervals = self.get_catchup_intervals(catchup_start, now)
-                        if catchup_intervals:
-                            catchup_fname = f"Catchup_{now.strftime('%Y%m%d-%H%M%S')}.pdf"
-                            catchup_path = os.path.join(SUMMARY_FOLDER, catchup_fname)
-
-                            # We pass get_sum_data (wrapper) to generate_catchup_report
-                            # get_sum_data requires 'period' as override
-                            # But get_sum_data signature is (self, override_period=None)
-                            # so we can use a lambda
-                            c_success = self.report_manager.generate_catchup_report(
-                                catchup_path,
-                                catchup_intervals,
-                                self.data_manager,
-                                lambda period: self.get_sum_data(override_period=period)
-                            )
-                            if c_success:
-                                extra_attachments.append(catchup_path)
-
-                    self.email_manager.trigger_summary_email(
-                        recipient, full_path, LEDGER_FILE, self.data_manager.business_name,
-                        self.data_manager.summary_count, self.session_user,
-                        extra_attachments=extra_attachments,
-                        on_success=self.update_email_sync_timestamp
-                    )
-
-                messagebox.showinfo("Success", f"Summary Generated & Sent.\nReceipt: {fname}")
+                messagebox.showinfo("Success", f"Summary Generated.\nReceipt: {fname}")
             else:
-                messagebox.showinfo("History Generated", f"Historical PDF Generated (No Email/Counter).\nFile: {fname}")
+                messagebox.showinfo("History Generated", f"Historical PDF Generated (No Counter).\nFile: {fname}")
+
+    def generate_daily_summary_on_close(self, target_date: Optional[datetime.datetime] = None):
+        today = target_date if target_date else datetime.datetime.now()
+        start_of_day = today.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_day = today.replace(hour=23, minute=59, second=59, microsecond=999999)
+        period = (start_of_day, end_of_day)
+        
+        data, in_c, out_c, corr_list = self.get_sum_data(override_period=period)
+        
+        tot = 0
+        total_cash = 0.0
+        total_change = 0.0
+        per_trans = []
+        
+        sales_cash = {}
+        for trans in self.data_manager.ledger:
+            try:
+                ts = datetime.datetime.strptime(trans.get('timestamp', ''), "%Y-%m-%d %H:%M:%S")
+                if start_of_day <= ts <= end_of_day:
+                    t_type = trans.get('type')
+                    fname = trans.get('filename')
+                    
+                    if t_type == 'sales':
+                        cash_tnd = float(trans.get('cash_tendered', 0.0))
+                        change_amt = float(trans.get('change', 0.0))
+                        total_disc = float(trans.get('total_discount', 0.0))
+                        sales_cash[fname] = {'cash': cash_tnd, 'change': change_amt, 'total_discount': total_disc}
+                        
+                        time_str = ts.strftime("%I:%M %p")
+                        items = []
+                        trans_subtot = 0.0
+                        
+                        for item in trans.get('items', []):
+                            name = item.get('name', '')
+                            if name in self.data_manager.display_name_map:
+                                name = self.data_manager.display_name_map[name]
+                            price = float(item.get('price', 0.0))
+                            qty = int(item.get('qty', 0))
+                            subtotal = float(item.get('subtotal', price * qty))
+                            trans_subtot += subtotal
+                            
+                            is_variant = item.get('is_variant') or name.startswith('(')
+                            
+                            items.append({
+                                'name': name,
+                                'price': price,
+                                'qty': qty,
+                                'subtotal': subtotal,
+                                'is_variant': is_variant
+                            })
+                        
+                        per_trans.append({
+                            'type': 'sales',
+                            'time': time_str,
+                            'filename': fname,
+                            'subtotal': trans_subtot,
+                            'cash': cash_tnd,
+                            'change': change_amt,
+                            'total_discount': total_disc,
+                            'items': items
+                        })
+                        tot += trans_subtot
+                        
+                    elif t_type == 'inventory':
+                        time_str = ts.strftime("%I:%M %p")
+                        items = []
+                        trans_qty = 0
+                        
+                        for item in trans.get('items', []):
+                            name = item.get('name', '')
+                            if name in self.data_manager.display_name_map:
+                                name = self.data_manager.display_name_map[name]
+                            qty = int(item.get('qty', 0))
+                            trans_qty += qty
+                            
+                            items.append({
+                                'name': name,
+                                'qty': qty
+                            })
+                            
+                        per_trans.append({
+                            'type': 'inventory',
+                            'time': time_str,
+                            'filename': fname,
+                            'total_qty': trans_qty,
+                            'items': items
+                        })
+                        
+                    elif t_type == 'correction' and trans.get('ref_type') == 'sales':
+                        ref = trans.get('ref_filename')
+                        if ref in sales_cash:
+                            if 'cash_tendered' in trans and 'change' in trans:
+                                sales_cash[ref]['cash'] = float(trans.get('cash_tendered', 0.0))
+                                sales_cash[ref]['change'] = float(trans.get('change', 0.0))
+                                for pt in per_trans:
+                                    if pt.get('filename') == ref:
+                                        pt['cash'] = sales_cash[ref]['cash']
+                                        pt['change'] = sales_cash[ref]['change']
+                                        break
+            except ValueError:
+                continue
+
+        total_cash = sum(x['cash'] for x in sales_cash.values())
+        total_change = sum(x['change'] for x in sales_cash.values())
+
+        fname = f"Daily_Summary_{today.strftime('%Y%m%d')}.pdf"
+        full_path = os.path.join(SUMMARY_FOLDER, fname)
+        
+        def sort_key(x):
+            cat = x['category']
+            if cat == "Phased Out": cat = "zzz_Phased Out"
+            return (cat, x['name'])
+        data.sort(key=sort_key)
+
+        is_per_trans = True
+        try:
+            if hasattr(self, 'chk_items_per_trans_var'):
+                is_per_trans = self.chk_items_per_trans_var.get()
+        except:
+            pass
+            
+        success = self.report_manager.generate_thermal_summary_receipt(
+            full_path, "DAILY SUMMARY", today.strftime('%Y-%m-%d %H:%M:%S'), today.strftime("%a, %d %b %y"),
+            data, per_trans, is_per_trans,
+            tot, total_cash, total_change, in_c, out_c, corr_list
+        )
+        if success:
+            print(f"Auto Daily Summary generated: {fname}")
 
     def get_catchup_start_time(self) -> Optional[datetime.datetime]:
         """Finds the timestamp of the oldest unsent Summary/History receipt."""
@@ -1939,12 +3697,15 @@ class POSSystem:
         bf.pack(anchor="w", pady=5)
         ttk.Button(bf, text="Backup (.json)", command=self.backup_data_json).pack(side="left", padx=5)
         ttk.Button(bf, text="Restore (.json)", command=self.restore_data_json).pack(side="left", padx=5)
+        ttk.Button(bf, text="View Beginning Inventory", command=self.view_today_bi).pack(side="left", padx=5)
 
         ttk.Separator(f, orient='horizontal').pack(fill='x', pady=10)
         ttk.Label(f, text="Maintenance", font=("Segoe UI", 10, "bold")).pack(anchor="w")
         mf = ttk.Frame(f)
         mf.pack(anchor="w", pady=5)
         ttk.Button(mf, text="Harmonize Receipts", command=lambda: self.harmonize_receipts(silent=False)).pack(side="left", padx=5)
+        ttk.Button(mf, text="Harmonize Usernames", command=self.harmonize_usernames).pack(side="left", padx=5)
+        ttk.Button(mf, text="Export Stock (XLSX)", command=self.export_stock_xlsx).pack(side="left", padx=5)
         ttk.Button(mf, text="Restore Products File", command=self.regenerate_products_file).pack(side="left", padx=5)
         ttk.Button(mf, text="Smart Cleanup", command=self.smart_cleanup).pack(side="left", padx=5)
 
@@ -1954,6 +3715,41 @@ class POSSystem:
 
         # Web Server Panel
         self.setup_web_server_panel(self.tab_settings_web)
+
+    def view_today_bi(self):
+        today_str = datetime.datetime.now().strftime('%Y%m%d')
+        fname = f"BI-{today_str}.pdf"
+        full_path = os.path.join(SUMMARY_FOLDER, fname)
+        
+        if not os.path.exists(full_path):
+            success = self.generate_beginning_inventory_report(silent=True)
+            if not success:
+                return # Error already shown in generator
+        
+        try:
+            if os.name == 'nt':
+                os.startfile(full_path)
+            else:
+                import subprocess
+                subprocess.call(['open' if sys.platform == 'darwin' else 'xdg-open', full_path])
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open PDF: {e}")
+
+    def ensure_recipient_email(self) -> None:
+        """
+        Called on startup. If recipient_email is blank in config, automatically
+        set it to SENDER_EMAIL so that BI and daily summary emails are always
+        sent without requiring the user to visit Settings first.
+        """
+        current = self.data_manager.config.get("recipient_email", "").strip()
+        if not current:
+            self.data_manager.config["recipient_email"] = SENDER_EMAIL
+            self.data_manager.save_config()
+            # Update the entry widget in Settings if it has been built
+            if hasattr(self, 'entry_email'):
+                self.entry_email.delete(0, tk.END)
+                self.entry_email.insert(0, SENDER_EMAIL)
+            print(f"[Startup] No recipient email configured. Defaulting to sender: {SENDER_EMAIL}")
 
     def verify_and_test_email(self):
         email_input = self.entry_email.get().strip()
@@ -2043,6 +3839,7 @@ class POSSystem:
                 backup_data = json.load(f)
 
             # Restore logic coordinated via DataManager
+            products_master = []
             if isinstance(backup_data, list):
                 self.data_manager.ledger = backup_data
                 self.data_manager.summary_count = 0
@@ -2053,21 +3850,49 @@ class POSSystem:
 
                 # Restore products if present (basic regen)
                 products_master = backup_data.get("products_master", [])
-                if products_master and self.mod.pd:
-                    try:
-                        new_df = self.mod.pd.DataFrame(products_master)
-                        new_df.to_excel(DATA_FILE, index=False)
-                        self.data_manager.load_products()
-                        # Update UI
-                        self.inv_dropdown['values'] = self.get_dropdown_values()
-                        self.pos_dropdown['values'] = self.get_dropdown_values()
-                    except Exception:
-                        pass # Non-critical
+                
+                # --- NEW LOGIC: Fallback to product_history if products_master missing ---
+                if not products_master:
+                    history = backup_data.get("product_history", [])
+                    if history and isinstance(history, list) and len(history) > 0:
+                        products_master = history[-1].get("items", [])
+
+            # --- NEW LOGIC: Reconstruct from transactions if still missing ---
+            if not products_master and self.data_manager.ledger:
+                extracted_products = {}
+                for entry in self.data_manager.ledger:
+                    for item in entry.get("items", []):
+                        name = item.get("name")
+                        if name:
+                            extracted_products[name] = {
+                                "Business Name": getattr(self.data_manager, 'business_name', "MY BUSINESS"),
+                                "Product Category": item.get("category", "UNCATEGORIZED"),
+                                "Product Name": name,
+                                "Price": item.get("price", 0.0)
+                            }
+                products_master = list(extracted_products.values())
+
+            if products_master and hasattr(self, 'mod') and self.mod.pd is not None:
+                try:
+                    new_df = self.mod.pd.DataFrame(products_master)
+                    new_df.to_excel(DATA_FILE, index=False)
+                    self.data_manager.load_products()
+                    # Update UI
+                    self.inv_dropdown['values'] = self.get_dropdown_values()
+                    self.pos_dropdown['values'] = self.get_dropdown_values()
+                except Exception:
+                    pass # Non-critical
 
             self.harmonize_receipts(silent=True)
             self.data_manager.save_ledger()
             self.data_manager.refresh_stock_cache()
-            messagebox.showinfo("Success", f"Restored {len(self.data_manager.ledger)} records.")
+            
+            # Set flag for BI and Summary generation upon restart
+            self.data_manager.config['restored_flag'] = True
+            self.data_manager.save_config()
+            
+            messagebox.showinfo("Restored", "Data restored successfully.\n\nThe application will now close. Please manually reopen it to finalize report synchronization.")
+            self.root.destroy()
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed: {e}")
@@ -2086,18 +3911,19 @@ class POSSystem:
                 fname = entry.get('filename')
                 date_str = entry.get('timestamp')
                 items = entry.get('items', [])
+                orig_user = entry.get('user', self.session_user)
 
                 if entry['type'] == "inventory":
                     self.report_manager.generate_grouped_pdf(
                         os.path.join(INVENTORY_FOLDER, fname), "INVENTORY RECEIPT", date_str,
                         items, ["Item", "Price", "Qty Added", "New Stock"], [1.0, 4.5, 5.5, 6.5],
-                        subtotal_indices=[2], is_inventory=True
+                        subtotal_indices=[2], is_inventory=True, user=orig_user
                     )
                 elif entry['type'] == "sales":
                     self.report_manager.generate_grouped_pdf(
                         os.path.join(RECEIPT_FOLDER, fname), "SALES RECEIPT", date_str, items,
                         ["Item", "Price", "Qty", "Total"], [1.0, 4.5, 5.5, 6.5],
-                        subtotal_indices=[2, 3]
+                        subtotal_indices=[2, 3], user=orig_user
                     )
                 elif entry['type'] == "correction":
                     pdf_items = []
@@ -2109,7 +3935,7 @@ class POSSystem:
                         })
                     self.report_manager.generate_grouped_pdf(
                         os.path.join(CORRECTION_FOLDER, fname), "CORRECTION RECEIPT", date_str,
-                        pdf_items, ["Item", "Orig", "Adj", "Final"], [1.0, 4.5, 5.5, 6.5]
+                        pdf_items, ["Item", "Orig", "Adj", "Final"], [1.0, 4.5, 5.5, 6.5], user=orig_user
                     )
 
             if not silent:
@@ -2178,9 +4004,9 @@ class POSSystem:
             if messagebox.askyesno("Confirm", f"Restore products from {version_data['timestamp']}?\nThis will overwrite products.xlsx."):
                 try:
                     df = self.mod.pd.DataFrame(items)
-                    # Ensure column order if possible, though not strictly required by load_products
-                    # load_products expects Business Name, Product Category, Product Name, Price
-                    df.to_excel(DATA_FILE, index=False)
+                    # Filter out internal columns (starting with underscore)
+                    clean_df = df[[c for c in df.columns if not str(c).startswith('_')]]
+                    clean_df.to_excel(DATA_FILE, index=False)
                     self.data_manager.load_products()
 
                     # Update UI Dropdowns
@@ -2287,7 +4113,7 @@ class POSSystem:
             messagebox.showerror("Load Test Error", f"Simulation failed: {e}")
 
     def delete_all_data(self):
-        confirm = messagebox.askyesno("Delete All Data", "Are you sure you want to delete all transaction data? This action cannot be undone and will permanently erase all receipts, inventory history, and sales data.", icon='warning')
+        confirm = messagebox.askyesno("Delete All Data", "Are you sure you want to delete all transaction data?\n\nThis will delete the entire AppData folder and all receipt folders.\nOnly the application and products.xlsx will remain.", icon='warning')
         if not confirm:
             return
 
@@ -2297,23 +4123,39 @@ class POSSystem:
             return
 
         try:
-            # Clear ledger
-            self.data_manager.ledger.clear()
-            self.data_manager.product_history.clear()
-            self.data_manager.summary_count = 0
-            self.data_manager.save_ledger()
+            # 1. Delete the AppData folder (contains config, ledger, backups)
+            if os.path.exists(APP_DATA_DIR):
+                shutil.rmtree(APP_DATA_DIR, ignore_errors=True)
 
-            for folder in [RECEIPT_FOLDER, INVENTORY_FOLDER, SUMMARY_FOLDER, CORRECTION_FOLDER]:
-                if os.path.exists(folder):
-                    shutil.rmtree(folder)
-                    os.makedirs(folder)
+            # 2. Cleanup current directory
+            # Keep only the executable/script and products.xlsx
+            if getattr(sys, 'frozen', False):
+                exe_name = os.path.basename(sys.executable)
+            else:
+                exe_name = os.path.basename(__file__)
+            
+            keep_files = {exe_name, DATA_FILE}
+            
+            cwd = os.getcwd()
+            for item in os.listdir(cwd):
+                if item in keep_files:
+                    continue
+                
+                item_path = os.path.join(cwd, item)
+                try:
+                    if os.path.isdir(item_path):
+                        shutil.rmtree(item_path, ignore_errors=True)
+                    else:
+                        os.remove(item_path)
+                except:
+                    pass # Best effort cleanup for locked files
 
-            self.data_manager.refresh_stock_cache()
-            self.refresh_inv()
-            self.refresh_pos()
-            self.refresh_correction_list()
-
-            messagebox.showinfo("Success", "All data has been successfully deleted.")
+            # 3. Notification (Optional, but good for UX)
+            # messagebox.showinfo("Success", "All data has been deleted. The application will now close.")
+            
+            # 4. Force Close immediately to avoid summary generation on exit
+            os._exit(0)
+            
         except Exception as e:
             messagebox.showerror("Error", f"Failed to delete all data: {e}")
 
@@ -2538,7 +4380,9 @@ class POSSystem:
                     df['Product Name'] = df['Product Name'].apply(lambda x: to_rename.get(str(x), str(x)))
                 
                 # Deduplicate by saving - wait, load_products will deduplicate automatically. We just rewrite the Excel.
-                df.to_excel(DATA_FILE, index=False)
+                # Filter out internal columns
+                clean_df = df[[c for c in df.columns if not str(c).startswith('_')]]
+                clean_df.to_excel(DATA_FILE, index=False)
 
                 # 4. Update ledger history mapping
                 with self.data_manager._ledger_lock:
@@ -2584,6 +4428,145 @@ class POSSystem:
         ttk.Button(btn_frame, text="Select All", command=select_all).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="Deselect All", command=deselect_all).pack(side="left", padx=5)
         ttk.Button(btn_frame, text="Approve & Rename", command=apply_changes, style="Accent.TButton").pack(side="left", padx=5)
+
+
+
+
+    def export_stock_xlsx(self):
+        # Category, Product Name, Stock
+        rows = []
+        for name in list(self.data_manager.stock_cache.keys()):
+            stk = self.data_manager.get_stock_level(name)
+            details = self.data_manager.get_product_details_by_str(name)
+            cat = details[3] if details else "Uncategorized"
+            rows.append({
+                "Category": cat,
+                "Product Name": name,
+                "Stock": stk
+            })
+        
+        if not self.data_manager.mod.pd:
+            messagebox.showerror("Error", "Pandas library not loaded.")
+            return
+            
+        df = self.data_manager.mod.pd.DataFrame(rows)
+        save_path = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel Files", "*.xlsx")])
+        if save_path:
+            try:
+                df.to_excel(save_path, index=False)
+                messagebox.showinfo("Success", f"Stock exported to:\n{save_path}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Export failed: {e}")
+
+    def import_stock_xlsx(self):
+        path = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx")])
+        if not path: return
+        
+        messagebox.showinfo("Import", "Please note that imported products will be added on top of existing stocks upon committing.")
+        
+        try:
+            if not self.data_manager.mod.pd:
+                messagebox.showerror("Error", "Pandas library not loaded.")
+                return
+            df = self.data_manager.mod.pd.read_excel(path)
+            # Validate columns
+            required = ["Category", "Product Name", "Stock"]
+            if not all(col in df.columns for col in required):
+                messagebox.showerror("Error", f"Invalid format. File must contain columns: {', '.join(required)}")
+                return
+            
+            imported_count = 0
+            errors = []
+            
+            for _, row in df.iterrows():
+                name = str(row['Product Name']).strip()
+                qty_val = row['Stock']
+                try:
+                    qty = int(qty_val)
+                except:
+                    continue
+                
+                # Validate against current products.xlsx
+                if name not in self.data_manager.name_lookup_cache:
+                    errors.append(name)
+                    continue
+                
+                # Add to inventory cart
+                it = self.data_manager.name_lookup_cache[name]
+                self.inventory_cart.append({
+                    "code": "",
+                    "name": name,
+                    "price": float(it.get('Price', 0)),
+                    "qty": qty,
+                    "category": it.get('Product Category', 'GENERAL')
+                })
+                imported_count += 1
+            
+            self.refresh_inv()
+            
+            if errors:
+                error_msg = f"Imported {imported_count} items.\n\nThe following products were NOT found in products.xlsx and were skipped:\n" + "\n".join(errors[:10])
+                if len(errors) > 10: error_msg += f"\n...and {len(errors)-10} more."
+                messagebox.showwarning("Import Partial", error_msg)
+            else:
+                messagebox.showinfo("Success", f"Successfully imported {imported_count} items to the inventory cart.")
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to import: {e}")
+
+    def harmonize_usernames(self):
+        if not self.data_manager.mod.PdfReader:
+            messagebox.showerror("Error", "pypdf library not found. Cannot read usernames from PDFs.")
+            return
+            
+        updated = 0
+        
+        for entry in self.data_manager.ledger:
+            if not entry.get('user'):
+                fname = entry.get('filename')
+                if not fname: continue
+                
+                t_type = entry.get('type')
+                
+                # Determine folder
+                folder = ""
+                if t_type == "sales": folder = RECEIPT_FOLDER
+                elif t_type == "inventory": folder = INVENTORY_FOLDER
+                elif t_type == "correction": folder = CORRECTION_FOLDER
+                elif t_type == "summary": folder = SUMMARY_FOLDER
+                
+                path = os.path.join(folder, fname)
+                if os.path.exists(path):
+                    try:
+                        reader = self.data_manager.mod.PdfReader(path)
+                        text = ""
+                        for page in reader.pages:
+                            text += page.extract_text()
+                        
+                        found_user = None
+                        if "Cashier: " in text:
+                            found_user = text.split("Cashier: ")[1].split("\n")[0].strip()
+                        elif "User: " in text:
+                            found_user = text.split("User: ")[1].split("\n")[0].strip()
+                        elif "by " in text:
+                            parts = text.split("by ")
+                            if len(parts) > 1:
+                                found_user = parts[1].split("\n")[0].split(" ")[0].strip() # Take first word mostly
+                        
+                        if found_user:
+                            # Clean up common PDF artifacts from split
+                            found_user = found_user.split(" ")[0].strip()
+                            if found_user:
+                                entry['user'] = found_user
+                                updated += 1
+                    except Exception as e:
+                        print(f"Error reading {path}: {e}")
+            
+        if updated > 0:
+            self.data_manager.save_ledger()
+            messagebox.showinfo("Success", f"Harmonized {updated} usernames in ledger.json.")
+        else:
+            messagebox.showinfo("Info", "No missing usernames found or could be recovered from PDFs.")
 
     # --- WEB SERVER GUI HELPERS ---
     def setup_web_server_panel(self, parent_frame):
@@ -2880,11 +4863,11 @@ class POSSystem:
 
     def check_beginning_inventory_reminder(self):
         today_str = datetime.datetime.now().strftime("%Y-%m-%d")
-        last_bi_date = self.data_manager.config.get("last_bi_date", "")
+        last_bi_date = self.data_manager.last_bi_date
         if last_bi_date != today_str:
             self.generate_beginning_inventory_report()
 
-    def generate_beginning_inventory_report(self):
+    def generate_beginning_inventory_report(self, silent: bool = False):
         today = datetime.datetime.now()
         today_str = today.strftime("%Y-%m-%d")
 
@@ -2927,48 +4910,59 @@ class POSSystem:
         fname = f"BI-{today.strftime('%Y%m%d')}.pdf"
         full_path = os.path.join(SUMMARY_FOLDER, fname)
 
-        success = self.report_manager.generate_grouped_pdf(
+        success = self.report_manager.generate_thermal_beginning_inventory_receipt(
             full_path, "BEGINNING INVENTORY",
-            today.strftime('%Y-%m-%d %H:%M:%S'), items,
-            ["Product", "Qty"],
-            [1.0, 6.0], is_summary=False,
-            extra_info=f"Start of Day: {today_str}",
-            is_bi=True
+            today.strftime('%Y-%m-%d %H:%M:%S'), items
         )
 
         if success:
             self.data_manager.summary_count += 1
+            self.data_manager.last_bi_date = today_str
             self.data_manager.save_ledger()
-            self.data_manager.config["last_bi_date"] = today_str
-            self.data_manager.save_config()
+
+            if silent:
+                print(f"Beginning Inventory generated (Silent/Regenerated): {fname}")
+                return True
 
             recipient = self.data_manager.config.get("recipient_email", "").strip()
-            if recipient:
-                # Mock a summary email call but override subject/body via extra_body if possible,
-                # or better yet, since trigger_summary_email generates a fixed subject format,
-                # we might want to manually send it or accept the format.
-                # The user asked for "Beginning Inventory" in subject/body.
-                # trigger_summary_email uses "[count]_TITLE_BIZ_DATE" subject format.
-                # I should manually send it to respect the "Beginning Inventory" requirement if trigger_summary_email is too rigid.
+            
+            yesterday = today - datetime.timedelta(days=1)
+            yesterday_str = yesterday.strftime('%Y%m%d')
+            old_summary_path = os.path.join(SUMMARY_FOLDER, f"Daily_Summary_{yesterday_str}.pdf")
+            
+            attachments = [full_path, LEDGER_FILE]
+            if os.path.exists(old_summary_path):
+                attachments.append(old_summary_path)
 
-                # However, trigger_summary_email is convenient. Let's look at it.
-                # Subject: [{count:04d}]_{APP_TITLE}_{safe_biz_name}_{date_str}
-                # Body: "Summary & Ledger..."
+            if not recipient:
+                recipient = SENDER_EMAIL
 
-                # I will call email_manager.send_email_thread directly to customize fully as requested.
+            safe_biz_name = "".join(c for c in self.data_manager.business_name if c.isalnum() or c in (' ', '_', '-')).strip()
+            subject = f"Beginning Inventory - {safe_biz_name} - {today_str}"
+            body = (f"Beginning Inventory Report.\n\n"
+                    f"User: {self.session_user}\n"
+                    f"Counter: {self.data_manager.summary_count:04d}\n"
+                    f"Date: {today_str}\n\n"
+                    f"Please find the Beginning Inventory PDF, Ledger database, and yesterday's Daily Summary (if available) attached.")
 
-                safe_biz_name = "".join(c for c in self.data_manager.business_name if c.isalnum() or c in (' ', '_', '-')).strip()
-                subject = f"Beginning Inventory - {safe_biz_name} - {today_str}"
-                body = (f"Beginning Inventory Report.\n\n"
-                        f"User: {self.session_user}\n"
-                        f"Counter: {self.data_manager.summary_count:04d}\n"
-                        f"Date: {today_str}\n\n"
-                        f"Please find the Beginning Inventory PDF and Ledger database attached.")
+            def on_email_error(err):
+                print(f"Beginning Inventory email failed, storing for catchup: {err}")
+                record = {
+                    "timestamp": today.strftime('%Y-%m-%d %H:%M:%S'),
+                    "files": attachments,
+                    "counter": self.data_manager.summary_count,
+                    "subject": subject
+                }
+                if not hasattr(self.data_manager, 'offline_receipts'):
+                    self.data_manager.offline_receipts = []
+                self.data_manager.offline_receipts.append(record)
+                self.data_manager.save_ledger()
 
-                self.email_manager.send_email_thread(
-                    recipient, subject, body,
-                    [full_path, LEDGER_FILE]
-                )
+            self.email_manager.send_email_thread(
+                recipient, subject, body,
+                attachments,
+                on_error=on_email_error
+            )
 
             # Optional: Silent or unobtrusive notification
             # self.root.after(500, lambda: messagebox.showinfo("Info", "Beginning Inventory generated."))
