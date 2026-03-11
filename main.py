@@ -12,9 +12,11 @@ import socket
 import queue
 import secrets
 import re
+import zipfile
+import tempfile
 from typing import Optional, List, Dict, Any, Tuple, Union, Set
 from PIL import Image, ImageTk
-from style_manager import StyleManager
+from style_manager import StyleManager, PASTEL_GREEN_BG, PASTEL_GREEN_ACCENT, PASTEL_GREEN_FG
 
 # pyinstaller --onefile --noconsole --splash splash_image3.png main.py
 
@@ -34,10 +36,11 @@ RECEIPT_FOLDER = "receipts"
 INVENTORY_FOLDER = "inventoryreceipts"
 SUMMARY_FOLDER = "summaryreceipts"
 CORRECTION_FOLDER = "correctionreceipts"
+SALESREPORT_FOLDER = "salesreport"
 DATA_FILE = "products.xlsx"
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
 LEDGER_FILE = os.path.join(APP_DATA_DIR, "ledger.json")
-APP_TITLE = "MMD Inventory Tracker v16.0"  # Refactored Version
+APP_TITLE = "MMD Inventory Tracker v16.10"  # Refactored Version
 
 # --- EMAIL CONFIGURATION ---
 SMTP_SERVER = "smtp.gmail.com"
@@ -46,11 +49,38 @@ SENDER_EMAIL = "mmdpos.diz@gmail.com"
 SENDER_PASSWORD = "wvdg kkka myuk inve"
 
 # Ensure folders exist
-for folder in [RECEIPT_FOLDER, INVENTORY_FOLDER, SUMMARY_FOLDER, CORRECTION_FOLDER]:
+for folder in [RECEIPT_FOLDER, INVENTORY_FOLDER, SUMMARY_FOLDER, CORRECTION_FOLDER, SALESREPORT_FOLDER]:
     if not os.path.exists(folder):
         os.makedirs(folder)
 
 # --- UTILS ---
+TIME_OFFSET = datetime.timedelta(seconds=0)
+
+def _sync_time_background():
+    global TIME_OFFSET
+    try:
+        import ntplib
+        client = ntplib.NTPClient()
+        response = client.request('ntp.pagasa.dost.gov.ph', version=3, timeout=5)
+        
+        # NTP response is in UTC timestamp, convert to PH Time (UTC+8)
+        ntp_utc = datetime.datetime.fromtimestamp(response.tx_time, tz=datetime.timezone.utc)
+        ntp_ph_time = ntp_utc.astimezone(datetime.timezone(datetime.timedelta(hours=8))).replace(tzinfo=None)
+        
+        # To compute offset, we need the local time at the moment the response was received
+        local_time = get_current_time() - TIME_OFFSET # Because get_current_time() already applies it
+        TIME_OFFSET = ntp_ph_time - local_time
+        print(f"Time synced with PH official time. Offset: {TIME_OFFSET}")
+    except Exception as e:
+        print(f"Time sync failed: {e}")
+
+# Start the background sync thread
+threading.Thread(target=_sync_time_background, daemon=True).start()
+
+def get_current_time() -> datetime.datetime:
+    """Returns the official PH government time if online, otherwise local PC time."""
+    return datetime.datetime.now() + TIME_OFFSET
+
 def truncate_product_name(name: str) -> str:
     if len(name) > 30:
         return name[:15] + name[-15:]
@@ -134,8 +164,8 @@ class DataManager:
             "previous_products": [],
             "recipient_email": "",
             "last_bi_date": "",
-            "touch_mode": False,
-            "last_email_sync": ""
+            "last_email_sync": "",
+            "known_categories": []
         }
         if os.path.exists(CONFIG_FILE):
             try:
@@ -146,6 +176,11 @@ class DataManager:
         else:
             self.config = default
 
+        # Cleanup legacy config keys
+        for key in ["splash_img", "touch_mode"]:
+            if key in self.config:
+                del self.config[key]
+
     def save_config(self) -> None:
         try:
             with open(CONFIG_FILE, 'w') as f:
@@ -154,6 +189,7 @@ class DataManager:
             print(f"Config Save Error: {e}")
 
     def load_ledger(self) -> None:
+        _loaded = False
         if os.path.exists(LEDGER_FILE):
             try:
                 with open(LEDGER_FILE, 'r') as f:
@@ -171,14 +207,15 @@ class DataManager:
                         self.product_history = data.get("product_history", [])
                         self.offline_receipts = data.get("offline_receipts", [])
                         self.last_bi_date = data.get("last_bi_date", "")
+                    _loaded = True
             except:
                 self.ledger = []
                 self.product_history = []
                 self.offline_receipts = []
 
-        # Optimization: Pre-parse dates could happen here if we used custom objects,
-        # but to keep JSON compatibility simple, we'll parse on demand or keep a shadow index if needed.
-        # For <10k records, on-demand parsing in calculate_stats is usually fine, but let's be careful.
+        # Re-save to ensure the ledger is stored in minified format
+        if _loaded:
+            self.save_ledger()
 
     def create_rolling_backup(self) -> None:
         """Creates a rolling backup of the ledger file in a background thread."""
@@ -195,7 +232,7 @@ class DataManager:
                 if not os.path.exists(LEDGER_FILE):
                     return
 
-                timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                timestamp = get_current_time().strftime("%Y%m%d-%H%M%S")
                 backup_name = f"ledger_backup_{timestamp}.json"
                 backup_path = os.path.join(BACKUP_DIR, backup_name)
                 shutil.copy2(LEDGER_FILE, backup_path)
@@ -229,7 +266,7 @@ class DataManager:
                 # Atomic Write
                 temp_file = LEDGER_FILE + ".tmp"
                 with open(temp_file, 'w') as f:
-                    json.dump(data, f, indent=2)
+                    json.dump(data, f, separators=(',', ':'))
                     f.flush()
                     os.fsync(f.fileno())
                 os.replace(temp_file, LEDGER_FILE)
@@ -446,7 +483,7 @@ class DataManager:
                 should_save_history = True
 
         if should_save_history and current_list:
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            timestamp = get_current_time().strftime("%Y-%m-%d %H:%M:%S")
             self.product_history.append({
                 "timestamp": timestamp,
                 "items": current_list
@@ -455,6 +492,18 @@ class DataManager:
             if len(self.product_history) > 4:
                 self.product_history = self.product_history[-4:]
             self.save_ledger()
+
+        # Category Validation
+        all_detected_cats = set(p['Product Category'] for p in valid_products)
+        known_cats = self.config.get("known_categories", [])
+        
+        # Backwards Compatibility: If known_categories is empty, initialize it with current ones
+        if not known_cats and all_detected_cats:
+            self.config["known_categories"] = sorted(list(all_detected_cats))
+            self.save_config()
+            known_cats = self.config["known_categories"]
+
+        new_categories = sorted(list(all_detected_cats - set(known_cats)))
 
         # Stats
         previous_products = set(self.config.get("previous_products", []))
@@ -465,16 +514,43 @@ class DataManager:
             "rejected": len(rejected_details),
             "phased_out": len(previous_products - current_products),
             "rejected_details": rejected_details,
-            "cleaned_names": cleaned_count
+            "cleaned_names": cleaned_count,
+            "new_categories": new_categories
         }
         self.config["previous_products"] = list(seen_names)
         self.save_config()
+
+    def clear_unconfirmed_categories(self, unconfirmed_cats: List[str]) -> None:
+        """
+        Removes the category value from products.xlsx for rows that match any of the unconfirmed categories.
+        """
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(DATA_FILE)
+            ws = wb.active
+            
+            # Find Category column index
+            cat_col_idx = None
+            for idx, cell in enumerate(ws[1], 1):
+                if cell.value and str(cell.value).strip() == "Product Category":
+                    cat_col_idx = idx
+                    break
+            
+            if cat_col_idx:
+                for row in ws.iter_rows(min_row=2):
+                    cell = row[cat_col_idx - 1]
+                    if cell.value and str(cell.value).strip() in unconfirmed_cats:
+                        cell.value = ""
+            
+            wb.save(DATA_FILE)
+        except Exception as e:
+            print(f"Failed to clear unconfirmed categories: {e}")
 
     def add_transaction(self, t_type: str, filename: str, items: List[Dict],
                         timestamp: Optional[str] = None, ref_type: str = None,
                         ref_filename: str = None, **kwargs) -> None:
         if not timestamp:
-            timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            timestamp = get_current_time().strftime('%Y-%m-%d %H:%M:%S')
 
         transaction = {
             "type": t_type,
@@ -519,7 +595,7 @@ class DataManager:
                     try:
                         dt = datetime.datetime.strptime(ts_str, self.date_fmt)
                     except:
-                        dt = datetime.datetime.now()
+                        dt = get_current_time()
 
                     s, e = period_filter
                     if not (s <= dt <= e):
@@ -540,29 +616,32 @@ class DataManager:
                     name = item.get('name', 'Unknown')
                     qty = int(item.get('qty', 0))
                     price = float(item.get('price', 0))
+                    item_cat = item.get('category', 'Uncategorized')
 
                     base_name = item.get('base_product', name)
                     
                     if base_name not in stats:
-                        stats[base_name] = {'name': base_name, 'in': 0, 'out': 0, 'sales_lines': [], 'in_lines': []}
+                        stats[base_name] = {'name': base_name, 'in': 0, 'out': 0, 'sales_lines': [], 'in_lines': [], 'latest_cat': item_cat}
+                    else:
+                        stats[base_name]['latest_cat'] = item_cat
 
                     if t_type == 'sales':
                         amt = float(item.get('subtotal', 0))
                         stats[base_name]['out'] += qty
                         # Include variant name for display if it's different from base_name
-                        display_item = {'name': name, 'price': price, 'qty': qty, 'amt': amt}
+                        display_item = {'name': name, 'price': price, 'qty': qty, 'amt': amt, 'category': item_cat}
                         stats[base_name]['sales_lines'].append(display_item)
                     elif t_type == 'inventory':
                         stats[base_name]['in'] += qty
-                        stats[base_name]['in_lines'].append({'price': price, 'qty': qty})
+                        stats[base_name]['in_lines'].append({'price': price, 'qty': qty, 'category': item_cat})
                     elif t_type == 'correction':
                         if ref_type == 'sales':
                             stats[base_name]['out'] += qty
                             amt = qty * price
-                            stats[base_name]['sales_lines'].append({'name': name, 'price': price, 'qty': qty, 'amt': amt})
+                            stats[base_name]['sales_lines'].append({'name': name, 'price': price, 'qty': qty, 'amt': amt, 'category': item_cat})
                         elif ref_type == 'inventory':
                             stats[base_name]['in'] += qty
-                            stats[base_name]['in_lines'].append({'price': price, 'qty': qty})
+                            stats[base_name]['in_lines'].append({'price': price, 'qty': qty, 'category': item_cat})
 
             except Exception:
                 continue
@@ -684,7 +763,7 @@ class ReportManager:
             content_width = width - (2 * margin)
             
             line_height = 10
-            base_height = 200 # For headers and footers
+            base_height = 215 # For headers and footers
             items_height = len(items) * line_height * 2 # 2 lines per item (name, then qty/price/sub)
             height = base_height + items_height
             
@@ -709,7 +788,11 @@ class ReportManager:
             y -= 10
             current_user = user if user else self.session_user
             c.drawString(margin, y, f"Cashier: {current_user}")
-            y -= 15
+            y -= 12
+            
+            c.setFont("Helvetica", 6)
+            c.drawCentredString(width / 2.0, y, "For internal use only.")
+            y -= 10
             
             # --- Divider ---
             c.setDash(2, 2)
@@ -819,7 +902,7 @@ class ReportManager:
             
             items_list = per_trans_data if is_per_trans else aggregated_data
             
-            base_height = 180
+            base_height = 195
             total_discount_sum = 0.0
             if is_per_trans:
                 for pt in per_trans_data:
@@ -875,7 +958,11 @@ class ReportManager:
             y -= 10
             current_user = user if user else self.session_user
             c.drawString(margin, y, f"Generated: {date_str} by {current_user}")
-            y -= 15
+            y -= 12
+            
+            c.setFont("Helvetica", 6)
+            c.drawCentredString(width / 2.0, y, "For internal use only.")
+            y -= 10
             
             c.setDash(2, 2)
             c.line(margin, y, width - margin, y)
@@ -1067,7 +1154,7 @@ class ReportManager:
             content_width = width - (2 * margin)
             
             line_height = 10
-            base_height = 160  # For headers and footers (shorter as no cash/change needed)
+            base_height = 175  # For headers and footers (shorter as no cash/change needed)
             items_height = len(items) * line_height * 2  # 2 lines per item (name, then details)
             height = base_height + items_height
             
@@ -1092,7 +1179,11 @@ class ReportManager:
             y -= 10
             current_user = user if user else self.session_user
             c.drawString(margin, y, f"User: {current_user}")
-            y -= 15
+            y -= 12
+            
+            c.setFont("Helvetica", 6)
+            c.drawCentredString(width / 2.0, y, "For internal use only.")
+            y -= 10
             
             # --- Divider ---
             c.setDash(2, 2)
@@ -1178,7 +1269,7 @@ class ReportManager:
             # We'll use multiple pages if we exceed a safe limit per page (150 inches)
             max_page_height = 144 * inch 
             row_height = 13 # Compact 1-line row height
-            base_overhead = 160 # For header, footers and dividers
+            base_overhead = 175 # For header, footers and dividers
 
             # Group by category
             def sort_key(x):
@@ -1215,7 +1306,11 @@ class ReportManager:
                 curr_y -= 10
                 current_user = user if user else self.session_user
                 canv.drawString(margin, curr_y, f"User: {current_user}")
-                curr_y -= 12
+                curr_y -= 10
+                
+                canv.setFont("Helvetica", 6)
+                canv.drawCentredString(width / 2.0, curr_y, "For internal use only.")
+                curr_y -= 10
                 
                 # --- Divider ---
                 canv.setDash(2, 2)
@@ -1354,7 +1449,11 @@ class ReportManager:
             if extra_info:
                 y -= 0.2 * inch
                 c.drawString(1 * inch, y, extra_info)
-            y -= 0.5 * inch
+            y -= 0.2 * inch
+            
+            c.setFont("Helvetica", 8)
+            c.drawString(1 * inch, y, "For internal use only.")
+            y -= 0.4 * inch
 
             # Columns
             c.setFont("Helvetica-Bold", 9)
@@ -1594,16 +1693,43 @@ class EmailManager:
                 msg['Subject'] = subject
                 msg.attach(MIMEText(body, 'plain'))
 
-                if attachment_paths:
-                    for path in attachment_paths:
-                        if os.path.exists(path):
-                            filename = os.path.basename(path)
-                            with open(path, "rb") as attachment:
-                                part = MIMEBase("application", "octet-stream")
-                                part.set_payload(attachment.read())
-                            encoders.encode_base64(part)
-                            part.add_header("Content-Disposition", f"attachment; filename= {filename}")
-                            msg.attach(part)
+                temp_zips = []
+                try:
+                    if attachment_paths:
+                        for path in attachment_paths:
+                            if os.path.exists(path):
+                                filename = os.path.basename(path)
+                                _, ext = os.path.splitext(filename)
+
+                                if ext.lower() in ('.pdf', '.xlsx'):
+                                    # Attach PDFs and XLSX directly (already compressed)
+                                    with open(path, "rb") as attachment:
+                                        part = MIMEBase("application", "octet-stream")
+                                        part.set_payload(attachment.read())
+                                    encoders.encode_base64(part)
+                                    part.add_header("Content-Disposition", f"attachment; filename= {filename}")
+                                    msg.attach(part)
+                                else:
+                                    # Compress non-PDF/non-XLSX files (e.g. .json) into a zip
+                                    zip_filename = filename + ".zip"
+                                    temp_zip = os.path.join(tempfile.gettempdir(), zip_filename)
+                                    temp_zips.append(temp_zip)
+                                    with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as zf:
+                                        zf.write(path, filename)
+                                    with open(temp_zip, "rb") as attachment:
+                                        part = MIMEBase("application", "octet-stream")
+                                        part.set_payload(attachment.read())
+                                    encoders.encode_base64(part)
+                                    part.add_header("Content-Disposition", f"attachment; filename= {zip_filename}")
+                                    msg.attach(part)
+                finally:
+                    # Clean up temporary zip files
+                    for tz in temp_zips:
+                        try:
+                            if os.path.exists(tz):
+                                os.remove(tz)
+                        except:
+                            pass
 
                 context = ssl.create_default_context()
                 with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
@@ -1636,14 +1762,22 @@ class EmailManager:
                               extra_attachments: List[str] = None, on_success: Any = None) -> None:
         # Remove if not recipient: return to allow defaulting in send_email_thread
 
-        date_str = datetime.datetime.now().strftime("%Y%m%d")
-        safe_biz_name = "".join(c for c in business_name if c.isalnum() or c in (' ', '_', '-')).strip()
-        subject = f"[{count:04d}]_{APP_TITLE}_{safe_biz_name}_{date_str}"
-        body = (f"Summary & Ledger.\n\n"
-                f"User: {user}\n"
-                f"Counter: {count:04d}\n"
-                f"Time: {datetime.datetime.now()}\n\n"
-                f"{extra_body}")
+        date_str = get_current_time().strftime("%Y-%m-%d")
+        subject = f"[{count:04d}] {business_name} - System Report ({date_str})"
+        
+        body = (
+            f"Hello,\n\n"
+            f"Here is the requested system report and latest ledger data for {business_name}.\n\n"
+            f"--- Details ---\n"
+            f"Generated By:  {user}\n"
+            f"Email Counter: {count:04d}\n"
+            f"Date & Time:   {get_current_time().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"---------------\n\n"
+            f"{extra_body}\n"
+            f"Attachments: PDF Report & JSON Database Backup (ledger.json).\n\n"
+            f"Best regards,\n"
+            f"{APP_TITLE}"
+        )
 
         attachments = [summary_pdf_path, ledger_path]
         if extra_attachments:
@@ -1750,13 +1884,12 @@ class POSSystem:
             self.root.attributes('-zoomed', True)
 
         # Session
-        login_time = datetime.datetime.now().strftime("%H%M%S")
+        login_time = get_current_time().strftime("%H%M%S")
         self.session_user = f"{username}-{login_time}"
 
         # Initialize Managers
         if splash: splash.update_status("Loading Data Manager...")
         self.data_manager = DataManager(self.mod)
-        self.touch_mode = self.data_manager.config.get("touch_mode", False)
 
         self.report_manager = ReportManager(self.mod, self.data_manager.business_name, self.session_user, self.data_manager)
         self.email_manager = EmailManager(self.mod)
@@ -1779,6 +1912,7 @@ class POSSystem:
 
         # Build UI
         if splash: splash.update_status("Building UI...")
+        self.style_manager = StyleManager(self.root)
         self.setup_ui()
         self.ensure_recipient_email()
         self.show_startup_report()
@@ -1792,8 +1926,6 @@ class POSSystem:
 
     # --- UI SETUP ---
     def setup_ui(self):
-        self.style_manager = StyleManager(self.root, self.touch_mode)
-
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(expand=True, fill='both', padx=2, pady=2)
 
@@ -1802,6 +1934,7 @@ class POSSystem:
         self.tab_correction = ttk.Frame(self.notebook)
         self.tab_receipts = ttk.Frame(self.notebook)
         self.tab_summary = ttk.Frame(self.notebook)
+        self.tab_sales_report = ttk.Frame(self.notebook)
         self.tab_settings = ttk.Frame(self.notebook)
 
         self.notebook.add(self.tab_inventory, text="Inventory")
@@ -1809,6 +1942,7 @@ class POSSystem:
         self.notebook.add(self.tab_correction, text="Correction")
         self.notebook.add(self.tab_receipts, text="Receipts")
         self.notebook.add(self.tab_summary, text="Summary")
+        self.notebook.add(self.tab_sales_report, text="Sales Report")
         self.notebook.add(self.tab_settings, text="Settings")
 
         self.setup_inventory_tab()
@@ -1816,6 +1950,7 @@ class POSSystem:
         self.setup_correction_tab()
         self.setup_receipts_tab()
         self.setup_summary_tab()
+        self.setup_sales_report_tab()
         self.setup_settings_tab()
 
         self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_change)
@@ -1925,13 +2060,21 @@ class POSSystem:
             recipient = SENDER_EMAIL
             
         safe_biz_name = "".join(c for c in self.data_manager.business_name if c.isalnum() or c in (' ', '_', '-')).strip()
-        subject = f"Catchup Email - {safe_biz_name} - {datetime.datetime.now().strftime('%Y%m%d')}"
+        subject = f"Catchup Email - {safe_biz_name} - {get_current_time().strftime('%Y%m%d')}"
         
         body = (f"Catchup Email.\n\n"
-                f"This email contains receipts that failed to send previously due to being offline.\n"
-                f"Covered Period: {covered_start} to {covered_end}\n\n"
-                f"Please find the compiled PDF of all unsent receipts attached."
-                f"{' The latest Ledger database is also attached.' if latest_ledger else ''}")
+                f"This email contains items that failed to send previously due to being offline.\n"
+                f"Covered Period: {covered_start} to {covered_end}\n\n")
+        
+        if has_pdfs or latest_ledger:
+            body += f"Please find the compiled PDF of all unsent receipts attached." if has_pdfs else ""
+            body += f"{' The latest Ledger database is also attached.' if latest_ledger else ''}\n\n"
+            
+        has_text = False
+        for r in receipts:
+            if 'body' in r:
+                body += f"--- {r.get('subject', 'Offline Log')} ---\n{r['body']}\n\n"
+                has_text = True
         
         attachments = []
         if has_pdfs and os.path.exists(compiled_pdf_path):
@@ -1939,8 +2082,8 @@ class POSSystem:
         if latest_ledger:
             attachments.append(latest_ledger)
             
-        if not attachments:
-            print("No valid attachments found for catchup email. Clearing queue.")
+        if not attachments and not has_text:
+            print("No valid attachments or logs found for catchup email. Clearing queue.")
             self.data_manager.offline_receipts.clear()
             self.data_manager.save_ledger()
             return
@@ -2005,20 +2148,39 @@ class POSSystem:
         self.root.update()
         stats = self.data_manager.startup_stats
 
+        # --- New Category Confirmation ---
+        new_cats = stats.get('new_categories', [])
+        if new_cats:
+            if not self._handle_new_categories_confirmation(new_cats):
+                return # App already closed or about to close inside helper
+
+        
+        phased_out_with_stock = 0
+        names_in_excel = set(self.data_manager.products_df['Product Name'].astype(str))
+        for name, st in self.data_manager.stock_cache.items():
+            stock = st['in'] - st['out']
+            if name not in names_in_excel and stock != 0:
+                phased_out_with_stock += 1
+
+        po_warning = ""
+        if phased_out_with_stock > 0:
+            po_warning = f"\n\nWARNING: You have {phased_out_with_stock} phased out product(s) with existing inventory.\nPlease go to the Settings tab to clear them."
+
         if stats.get('rejected', 0) == 0:
             msg = (f"Business: {self.data_manager.business_name}\n"
                    f"Product Load Summary:\nTotal Loaded: {stats['total']}\n"
                    f"New Products: {stats['new']}\n"
                    f"Cleaned Names: {stats.get('cleaned_names', 0)}\n"
                    f"Rejected (Errors): {stats['rejected']}\n"
-                   f"Phased-Out: {stats['phased_out']}")
+                   f"Phased-Out: {stats['phased_out']}"
+                   f"{po_warning}")
             messagebox.showinfo("Startup Report", msg)
             return
 
         # Custom Dialog for Rejections
         win = tk.Toplevel(self.root)
         win.title("Startup Report")
-        win.geometry("350x300")
+        win.geometry("380x350")
 
         ttk.Label(win, text=f"Business: {self.data_manager.business_name}", font=("Segoe UI", 11, "bold")).pack(pady=10)
 
@@ -2030,6 +2192,9 @@ class POSSystem:
         ttk.Label(f, text=f"Cleaned Names: {stats.get('cleaned_names', 0)}").pack(anchor="w")
         ttk.Label(f, text=f"Rejected (Errors): {stats['rejected']}", foreground="red", font=("Segoe UI", 9, "bold")).pack(anchor="w")
         ttk.Label(f, text=f"Phased-Out: {stats['phased_out']}").pack(anchor="w")
+        
+        if phased_out_with_stock > 0:
+            ttk.Label(f, text=po_warning.strip(), foreground="darkorange", font=("Segoe UI", 9, "bold"), wraplength=320).pack(anchor="w", pady=(10,0))
 
         def show_rejected():
             r_win = tk.Toplevel(win)
@@ -2051,11 +2216,86 @@ class POSSystem:
         ttk.Button(win, text="VIEW REJECTED PRODUCTS", command=show_rejected, style="Danger.TButton").pack(pady=15, ipadx=10)
         ttk.Button(win, text="OK", command=win.destroy).pack(pady=5, ipadx=20)
 
+    def _handle_new_categories_confirmation(self, new_cats: List[str]) -> bool:
+        """
+        Shows a dialog listing new categories. User must type 'confirm' to proceed.
+        Returns True if confirmed, False otherwise.
+        """
+        result = [False]
+        win = tk.Toplevel(self.root)
+        win.title("NEW PRODUCT CATEGORIES DETECTED")
+        win.geometry("450x350")
+        win.grab_set() # Modal
+        
+        # Center the window
+        win.update_idletasks()
+        w = win.winfo_width()
+        h = win.winfo_height()
+        sw = win.winfo_screenwidth()
+        sh = win.winfo_screenheight()
+        win.geometry(f"+{int(sw/2 - w/2)}+{int(sh/2 - h/2)}")
+
+        ttk.Label(win, text="NEW CATEGORIES FOUND:", font=("Segoe UI", 11, "bold")).pack(pady=(20, 10))
+        
+        # List categories in a scrollable or text area if many
+        list_frame = ttk.Frame(win)
+        list_frame.pack(fill="both", expand=True, padx=30)
+        
+        txt = tk.Text(list_frame, height=5, font=("Consolas", 10), state="normal")
+        txt.pack(side="left", fill="both", expand=True)
+        for cat in new_cats:
+            txt.insert("end", f"• {cat}\n")
+        txt.config(state="disabled")
+        
+        scrollbar = ttk.Scrollbar(list_frame, command=txt.yview)
+        scrollbar.pack(side="right", fill="y")
+        txt['yscrollcommand'] = scrollbar.set
+
+        ttk.Label(win, text="To accept these categories, type 'confirm' below:", font=("Segoe UI", 9)).pack(pady=(15, 5))
+        
+        entry_var = tk.StringVar()
+        entry = ttk.Entry(win, textvariable=entry_var, justify="center", font=("Consolas", 11))
+        entry.pack(pady=5, padx=50, fill="x")
+        entry.focus_set()
+
+        def on_confirm(*args):
+            if entry_var.get().strip().lower() == "confirm":
+                # Save to known categories
+                known = self.data_manager.config.get("known_categories", [])
+                for cat in new_cats:
+                    if cat not in known:
+                        known.append(cat)
+                self.data_manager.config["known_categories"] = sorted(known)
+                self.data_manager.save_config()
+                result[0] = True
+                win.destroy()
+            else:
+                messagebox.showwarning("Validation", "Please type 'confirm' exactly to proceed.")
+
+        def on_cancel():
+            if messagebox.askyesno("Cancel", "Rejecting new categories will clear them from products.xlsx\nand CLOSE the software. Continue?"):
+                self.data_manager.clear_unconfirmed_categories(new_cats)
+                self.root.destroy()
+                sys.exit(0)
+
+        # Intercept window close button
+        win.protocol("WM_DELETE_WINDOW", on_cancel)
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(pady=20)
+        ttk.Button(btn_frame, text="CONFIRM", command=on_confirm).pack(side="left", padx=10)
+        ttk.Button(btn_frame, text="CANCEL / REJECT", command=on_cancel).pack(side="left")
+
+        entry.bind("<Return>", on_confirm)
+        
+        self.root.wait_window(win)
+        return result[0]
+
     def check_restored_status(self):
         if self.data_manager.config.get('restored_flag'):
             try:
                 # Generate Yesterday's Summary
-                yesterday = datetime.datetime.now() - datetime.timedelta(days=1)
+                yesterday = get_current_time() - datetime.timedelta(days=1)
                 self.generate_daily_summary_on_close(target_date=yesterday)
                 
                 # Generate Today's BI (Beginning Inventory) - Now with email enabled to notify user after restore
@@ -2150,7 +2390,7 @@ class POSSystem:
 
     def commit_inv(self):
         if not self.inventory_cart: return
-        now = datetime.datetime.now()
+        now = get_current_time()
         date_str = now.strftime('%Y-%m-%d %H:%M:%S')
         fname = f"Inventory_{now.strftime('%Y%m%d-%H%M%S')}.pdf"
 
@@ -2596,7 +2836,7 @@ class POSSystem:
         dialog.bind('<Escape>', lambda e: dialog.destroy())
 
     def _finalize_checkout(self, cash_tendered: float, change: float):
-        now = datetime.datetime.now()
+        now = get_current_time()
         date_str = now.strftime('%Y-%m-%d %H:%M:%S')
         fname = f"{now.strftime('%Y%m%d-%H%M%S')}.pdf"
 
@@ -2677,7 +2917,7 @@ class POSSystem:
     def refresh_correction_list(self):
         for i in self.corr_list_tree.get_children(): self.corr_list_tree.delete(i)
         target_type = self.corr_type_var.get()
-        now_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        now_str = get_current_time().strftime("%Y-%m-%d")
 
         for trans in self.data_manager.ledger:
             if trans.get('type') == target_type:
@@ -2745,7 +2985,7 @@ class POSSystem:
         ref_file = self.selected_transaction['filename']
         # Note: logic to remove old correction entry in ledger is complex, keeping simple append for safety
 
-        now = datetime.datetime.now()
+        now = get_current_time()
         date_str = now.strftime('%Y-%m-%d %H:%M:%S')
         fname = f"Cor_{now.strftime('%Y%m%d-%H%M%S')}.pdf"
 
@@ -2816,17 +3056,17 @@ class POSSystem:
         self.rec_frame_custom_date = ttk.Frame(filter_row)
         self.rec_frame_custom_date.pack(side="left")
 
-        current_year = datetime.datetime.now().year
+        current_year = get_current_time().year
         self.rec_cmb_year = ttk.Combobox(self.rec_frame_custom_date, values=[y for y in range(current_year - 5, current_year + 2)], width=5, state="disabled")
         self.rec_cmb_year.set(current_year)
         self.rec_cmb_year.pack(side="left", padx=1)
 
         self.rec_cmb_month = ttk.Combobox(self.rec_frame_custom_date, values=[str(m).zfill(2) for m in range(1, 13)], width=3, state="disabled")
-        self.rec_cmb_month.set(str(datetime.datetime.now().month).zfill(2))
+        self.rec_cmb_month.set(str(get_current_time().month).zfill(2))
         self.rec_cmb_month.pack(side="left", padx=1)
 
         self.rec_cmb_day = ttk.Combobox(self.rec_frame_custom_date, values=[str(d).zfill(2) for d in range(1, 32)], width=3, state="disabled")
-        self.rec_cmb_day.set(str(datetime.datetime.now().day).zfill(2))
+        self.rec_cmb_day.set(str(get_current_time().day).zfill(2))
         self.rec_cmb_day.pack(side="left", padx=1)
 
         ttk.Label(left_frame, text="Type:").pack(anchor="w", padx=5, pady=(5,0))
@@ -2879,9 +3119,9 @@ class POSSystem:
                 d = int(self.rec_cmb_day.get())
                 target_date = datetime.datetime(y, m, d).strftime("%Y-%m-%d")
             except ValueError:
-                target_date = datetime.datetime.now().strftime("%Y-%m-%d")
+                target_date = get_current_time().strftime("%Y-%m-%d")
         else:
-            target_date = datetime.datetime.now().strftime("%Y-%m-%d")
+            target_date = get_current_time().strftime("%Y-%m-%d")
             
         target_type = self.rec_type_var.get().lower()
         
@@ -3020,7 +3260,7 @@ class POSSystem:
         self.frame_custom_date = ttk.Frame(f)
         self.frame_custom_date.pack(side="left")
 
-        current_year = datetime.datetime.now().year
+        current_year = get_current_time().year
         self.cmb_year = ttk.Combobox(self.frame_custom_date,
                                      values=[y for y in range(current_year - 5, current_year + 2)], width=5,
                                      state="disabled")
@@ -3029,12 +3269,12 @@ class POSSystem:
 
         self.cmb_month = ttk.Combobox(self.frame_custom_date, values=[str(m).zfill(2) for m in range(1, 13)], width=3,
                                       state="disabled")
-        self.cmb_month.set(str(datetime.datetime.now().month).zfill(2))
+        self.cmb_month.set(str(get_current_time().month).zfill(2))
         self.cmb_month.pack(side="left", padx=1)
 
         self.cmb_day = ttk.Combobox(self.frame_custom_date, values=[str(d).zfill(2) for d in range(1, 32)], width=3,
                                     state="disabled")
-        self.cmb_day.set(str(datetime.datetime.now().day).zfill(2))
+        self.cmb_day.set(str(get_current_time().day).zfill(2))
         self.cmb_day.pack(side="left", padx=1)
 
         ttk.Button(f, text="Refresh View", command=self.gen_view).pack(side="left", padx=10)
@@ -3122,7 +3362,7 @@ class POSSystem:
                 messagebox.showerror("Date Error", "Invalid Custom Date selected.")
                 return None
         else:
-            anchor = datetime.datetime.now().replace(microsecond=0)
+            anchor = get_current_time().replace(microsecond=0)
 
         mode = self.report_type.get()
         if mode == "Daily": return anchor.replace(hour=0, minute=0, second=0), anchor
@@ -3146,58 +3386,69 @@ class POSSystem:
         rows = []
         all_names = set(self.data_manager.products_df['Product Name'].astype(str)) | set(global_stats.keys())
 
+        names_in_excel = set(self.data_manager.products_df['Product Name'].astype(str))
+
         for name in all_names:
             name = name.strip()
             g_data = global_stats.get(name, {'in': 0, 'out': 0})
             rem_stock = g_data['in'] - g_data['out']
 
-            _, _, curr_price, cat = self.data_manager.get_product_details_by_str(f"{name}")
+            _, _, curr_price, config_cat = self.data_manager.get_product_details_by_str(f"{name}")
             p_data = period_stats.get(name, {'in': 0, 'out': 0, 'sales_lines': [], 'in_lines': []})
 
-            price_map = {}
-            # Aggregate by variant name and price point
-            for line in p_data['sales_lines']:
+            prices_map = {}
+            # Aggregate by variant name and price point AND category
+            for line in p_data.get('sales_lines', []):
                 line_name = line.get('name', name)
-                key = (line_name, line['price'])
-                if key not in price_map: price_map[key] = {'in': 0, 'out': 0, 'sales': 0}
-                price_map[key]['out'] += line['qty']
-                price_map[key]['sales'] += line['amt']
-            for line in p_data['in_lines']:
+                line_cat = line.get('category', config_cat)
+                key = (line_name, line['price'], line_cat)
+                if key not in prices_map: prices_map[key] = {'in': 0, 'out': 0, 'sales': 0}
+                prices_map[key]['out'] += line['qty']
+                prices_map[key]['sales'] += line.get('amt', 0.0)
+
+            for line in p_data.get('in_lines', []):
                 line_name = line.get('name', name)
-                key = (line_name, line['price'])
-                if key not in price_map: price_map[key] = {'in': 0, 'out': 0, 'sales': 0}
-                price_map[key]['in'] += line['qty']
+                line_cat = line.get('category', config_cat)
+                key = (line_name, line['price'], line_cat)
+                if key not in prices_map: prices_map[key] = {'in': 0, 'out': 0, 'sales': 0}
+                prices_map[key]['in'] += line['qty']
 
-            if not price_map: price_map[(name, curr_price)] = {'in': 0, 'out': 0, 'sales': 0}
+            if not prices_map: 
+                final_cat = config_cat
+                if config_cat == "Phased Out" and name in global_stats:
+                    final_cat = global_stats[name].get('latest_cat', "Phased Out")
+                prices_map[(name, curr_price, final_cat)] = {'in': 0, 'out': 0, 'sales': 0}
 
-            for (variant_name, price), data in price_map.items():
+            for (variant_name, price, variant_cat), data in prices_map.items():
                 is_variant = variant_name != name
                 show_rem = rem_stock if price == curr_price and not is_variant else 0
 
                 # Filter Logic
                 is_all_time = (self.report_type.get() == "All Time") and (override_period is None)
+                
+                # Identify if product is currently phased out in products.xlsx
+                is_phased_out_now = (name not in names_in_excel)
 
                 if not is_all_time:
                     if data['in'] == 0 and data['out'] == 0: continue
-                elif data['in'] == 0 and data['out'] == 0 and show_rem == 0 and name not in set(
-                        self.data_manager.products_df['Product Name']):
+                elif data['in'] == 0 and data['out'] == 0 and show_rem == 0 and is_phased_out_now:
                     continue
 
-                if cat == "Phased Out" and name in global_stats: 
-                    variant_name = global_stats[name]['name'] + " (Old)"
-                    if is_variant:
-                        variant_name = "  " + variant_name
-                elif is_variant:
-                    variant_name = "  " + variant_name
+                display_name = variant_name
+                if is_phased_out_now:
+                    if not display_name.endswith("(Old)"):
+                        display_name += " (Old)"
+                        
+                if is_variant:
+                    display_name = "  " + display_name
 
                 rows.append({
-                    'code': "", 'category': cat, 'name': variant_name, 'price': price,
+                    'code': "", 'category': variant_cat, 'name': display_name, 'price': price,
                     'in': data['in'], 'out': data['out'], 'remaining': show_rem, 'sales': data['sales'],
                     'base_name': name, 'is_variant': is_variant
                 })
 
         final_rows = []
-        names_in_excel = set(self.data_manager.products_df['Product Name'].astype(str))
         def sort_rows(r):
             cat = r['category']
             base = r['base_name']
@@ -3409,7 +3660,7 @@ class POSSystem:
                                              rem_val, f"{s['sales']:.2f}"))
                 tot += s['sales']
 
-        self.lbl_sum_info.config(text=f"Period: {p_txt} | Sales: {tot:.2f}")
+        self.lbl_sum_info.config(text=f"Period: {p_txt} | Sales: {tot:.2f} | Customers: {out_c}")
         
         # Calculate total discount for the period
         total_discount_period = 0.0
@@ -3441,7 +3692,7 @@ class POSSystem:
     def gen_pdf(self):
         is_custom_date = self.chk_custom_date_var.get()
         data, tot, p_txt, in_c, out_c, corr_list, is_daily, total_cash, total_change, per_trans = self.gen_view()
-        now = datetime.datetime.now()
+        now = get_current_time()
 
         prefix = "History" if is_custom_date else "Summary"
         fname = f"{prefix}-{now.strftime('%Y%m%d-%H%M%S')}.pdf"
@@ -3466,7 +3717,7 @@ class POSSystem:
                 messagebox.showinfo("History Generated", f"Historical PDF Generated (No Counter).\nFile: {fname}")
 
     def generate_daily_summary_on_close(self, target_date: Optional[datetime.datetime] = None):
-        today = target_date if target_date else datetime.datetime.now()
+        today = target_date if target_date else get_current_time()
         start_of_day = today.replace(hour=0, minute=0, second=0, microsecond=0)
         end_of_day = today.replace(hour=23, minute=59, second=59, microsecond=999999)
         period = (start_of_day, end_of_day)
@@ -3646,9 +3897,618 @@ class POSSystem:
         ]
 
     def update_email_sync_timestamp(self):
-        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = get_current_time().strftime("%Y-%m-%d %H:%M:%S")
         self.data_manager.config["last_email_sync"] = now_str
         self.data_manager.save_config()
+
+    # --- SALES REPORT TAB ---
+    def setup_sales_report_tab(self):
+        """Sets up the Sales Report tab with month/year selectors, data table, and export buttons."""
+        top_f = ttk.Frame(self.tab_sales_report)
+        top_f.pack(fill="x", padx=5, pady=5)
+
+        ttk.Label(top_f, text="Month:", font=("Segoe UI", 10, "bold")).pack(side="left", padx=(0, 2))
+        now = get_current_time()
+        self.sr_month_var = tk.StringVar(value=str(now.month).zfill(2))
+        self.sr_month_combo = ttk.Combobox(top_f, textvariable=self.sr_month_var,
+                                           values=[str(m).zfill(2) for m in range(1, 13)],
+                                           width=4, state="readonly")
+        self.sr_month_combo.pack(side="left", padx=2)
+
+        ttk.Label(top_f, text="Year:", font=("Segoe UI", 10, "bold")).pack(side="left", padx=(10, 2))
+        current_year = now.year
+        self.sr_year_var = tk.StringVar(value=str(current_year))
+        self.sr_year_combo = ttk.Combobox(top_f, textvariable=self.sr_year_var,
+                                          values=[str(y) for y in range(current_year - 5, current_year + 2)],
+                                          width=6, state="readonly")
+        self.sr_year_combo.pack(side="left", padx=2)
+
+        ttk.Button(top_f, text="Generate Report", command=self.refresh_sales_report,
+                   style="Accent.TButton").pack(side="left", padx=15, ipadx=8)
+
+        export_f = ttk.Frame(top_f)
+        export_f.pack(side="right")
+        ttk.Button(export_f, text="Export & Send", command=self.export_sales_report,
+                   style="Accent.TButton").pack(side="right", padx=3, ipadx=6)
+
+        # Treeview – columns are built dynamically based on categories
+        tree_frame = ttk.Frame(self.tab_sales_report)
+        tree_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        scroll_y = ttk.Scrollbar(tree_frame, orient="vertical")
+        scroll_y.pack(side="right", fill="y")
+        scroll_x = ttk.Scrollbar(tree_frame, orient="horizontal")
+        scroll_x.pack(side="bottom", fill="x")
+
+        self.sr_tree = ttk.Treeview(tree_frame, show="headings",
+                                    yscrollcommand=scroll_y.set,
+                                    xscrollcommand=scroll_x.set)
+        scroll_y.config(command=self.sr_tree.yview)
+        scroll_x.config(command=self.sr_tree.xview)
+        self.sr_tree.pack(fill="both", expand=True)
+
+        self.sr_tree.tag_configure('total_row', background='#C8E6C9', font=('Segoe UI', 10, 'bold'))
+        self.sr_tree.tag_configure('normal', font=('Segoe UI', 9))
+
+        # Bottom info
+        bottom_f = ttk.Frame(self.tab_sales_report)
+        bottom_f.pack(fill="x", padx=5, pady=2)
+        self.lbl_sr_info = ttk.Label(bottom_f, text="Select a month and year, then click Generate Report.",
+                                     font=("Segoe UI", 10))
+        self.lbl_sr_info.pack(side="left")
+
+        # Cache for export
+        self._sr_report_data = None
+        self._sr_categories = []
+        self._sr_month_label = ""
+
+    def _compute_sales_report_data(self):
+        """Scans the ledger and aggregates daily sales data for the selected month/year.
+        Returns (categories_sorted, daily_rows_dict, month_totals_dict, month_label_str).
+        Each daily_rows_dict[date_str] = {
+            'total_sales': float, 'total_discount': float, 'customers': int,
+            'cat_sales': {category: float, ...}
+        }
+        """
+        try:
+            sel_month = int(self.sr_month_var.get())
+            sel_year = int(self.sr_year_var.get())
+        except ValueError:
+            messagebox.showerror("Error", "Invalid month or year selected.")
+            return None
+
+        import calendar
+        month_name = calendar.month_name[sel_month]
+        month_label = f"{month_name} {sel_year}"
+
+        # Determine the date range
+        _, last_day = calendar.monthrange(sel_year, sel_month)
+        start_dt = datetime.datetime(sel_year, sel_month, 1, 0, 0, 0)
+        end_dt = datetime.datetime(sel_year, sel_month, last_day, 23, 59, 59)
+
+        # Collect all categories from products and from ledger sales in this period
+        all_categories = set()
+        daily_data = {}  # date_str -> {'total_sales', 'total_discount', 'customers', 'cat_sales': {cat: amt}}
+
+        for trans in self.data_manager.ledger:
+            try:
+                t_type = trans.get('type')
+                if t_type not in ('sales', 'correction'):
+                    continue
+
+                ts_str = trans.get('timestamp', '')
+                try:
+                    ts = datetime.datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+
+                if not (start_dt <= ts <= end_dt):
+                    continue
+
+                date_key = ts.strftime("%Y-%m-%d")
+
+                if date_key not in daily_data:
+                    daily_data[date_key] = {
+                        'total_sales': 0.0,
+                        'total_discount': 0.0,
+                        'customers': 0,
+                        'cat_sales': {}
+                    }
+
+                day = daily_data[date_key]
+
+                if t_type == 'sales':
+                    day['customers'] += 1
+                    total_disc = float(trans.get('total_discount', 0.0))
+                    day['total_discount'] += total_disc
+
+                    for item in trans.get('items', []):
+                        cat = item.get('category', 'Uncategorized')
+                        subtotal = float(item.get('subtotal', float(item.get('price', 0)) * int(item.get('qty', 0))))
+                        all_categories.add(cat)
+                        day['cat_sales'][cat] = day['cat_sales'].get(cat, 0.0) + subtotal
+                        day['total_sales'] += subtotal
+
+                elif t_type == 'correction' and trans.get('ref_type') == 'sales':
+                    # Corrections on sales adjust totals
+                    total_disc = float(trans.get('total_discount', 0.0))
+                    day['total_discount'] += total_disc
+
+                    for item in trans.get('items', []):
+                        cat = item.get('category', 'Uncategorized')
+                        price = float(item.get('price', 0))
+                        qty = int(item.get('qty', 0))
+                        subtotal = price * qty
+                        all_categories.add(cat)
+                        day['cat_sales'][cat] = day['cat_sales'].get(cat, 0.0) + subtotal
+                        day['total_sales'] += subtotal
+
+            except Exception:
+                continue
+
+        # Sort categories (exclude Phased Out — no sales possible from phased-out products)
+        all_categories.discard("Phased Out")
+        categories = sorted(all_categories)
+
+        return categories, daily_data, month_label
+
+    def refresh_sales_report(self):
+        """Refreshes the Sales Report treeview with aggregated data."""
+        result = self._compute_sales_report_data()
+        if result is None:
+            return
+
+        categories, daily_data, month_label = result
+
+        # Store for export
+        self._sr_categories = categories
+        self._sr_report_data = daily_data
+        self._sr_month_label = month_label
+
+        # Build treeview columns dynamically
+        col_ids = ["date"] + [f"cat_{i}" for i in range(len(categories))] + ["total_sales", "total_discount", "customers"]
+        self.sr_tree["columns"] = col_ids
+
+        # Configure columns
+        self.sr_tree.heading("date", text="Date")
+        self.sr_tree.column("date", width=100, anchor="center")
+
+        for i, cat in enumerate(categories):
+            col_id = f"cat_{i}"
+            self.sr_tree.heading(col_id, text=cat)
+            self.sr_tree.column(col_id, width=100, anchor="e")
+
+        self.sr_tree.heading("total_sales", text="Daily Total Sales")
+        self.sr_tree.column("total_sales", width=120, anchor="e")
+
+        self.sr_tree.heading("total_discount", text="Daily Total Discount")
+        self.sr_tree.column("total_discount", width=130, anchor="e")
+
+        self.sr_tree.heading("customers", text="Customers")
+        self.sr_tree.column("customers", width=80, anchor="center")
+
+        # Clear existing rows
+        for item in self.sr_tree.get_children():
+            self.sr_tree.delete(item)
+
+        if not daily_data:
+            self.lbl_sr_info.config(text=f"{month_label}: No sales data found.")
+            return
+
+        # Sort dates
+        sorted_dates = sorted(daily_data.keys())
+
+        # Monthly totals accumulators
+        month_total_sales = 0.0
+        month_total_discount = 0.0
+        month_total_customers = 0
+        month_cat_totals = {cat: 0.0 for cat in categories}
+
+        for date_str in sorted_dates:
+            day = daily_data[date_str]
+
+            # Format date for display (e.g. "Mar 01, Mon")
+            try:
+                dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+                display_date = dt.strftime("%b %d, %a")
+            except ValueError:
+                display_date = date_str
+
+            row_values = [display_date]
+
+            for i, cat in enumerate(categories):
+                cat_val = day['cat_sales'].get(cat, 0.0)
+                month_cat_totals[cat] += cat_val
+                row_values.append(f"{cat_val:,.2f}" if cat_val > 0 else "-")
+
+            row_values.append(f"{day['total_sales']:,.2f}")
+            row_values.append(f"{day['total_discount']:,.2f}" if day['total_discount'] > 0 else "-")
+            row_values.append(str(day['customers']))
+
+            month_total_sales += day['total_sales']
+            month_total_discount += day['total_discount']
+            month_total_customers += day['customers']
+
+            self.sr_tree.insert("", "end", values=row_values, tags=('normal',))
+
+        # Insert Monthly Totals row
+        totals_row = ["MONTHLY TOTAL"]
+        for cat in categories:
+            val = month_cat_totals[cat]
+            totals_row.append(f"{val:,.2f}" if val > 0 else "-")
+        totals_row.append(f"{month_total_sales:,.2f}")
+        totals_row.append(f"{month_total_discount:,.2f}" if month_total_discount > 0 else "-")
+        totals_row.append(str(month_total_customers))
+
+        self.sr_tree.insert("", "end", values=totals_row, tags=('total_row',))
+
+        self.lbl_sr_info.config(
+            text=f"{month_label} | Total Sales: {month_total_sales:,.2f} | "
+                 f"Total Discount: {month_total_discount:,.2f} | Customers: {month_total_customers}"
+        )
+
+    def export_sales_report(self):
+        """Generates both XLSX and PDF sales reports, then sends them via email."""
+        if not self._sr_report_data:
+            messagebox.showwarning("No Data", "Please generate a report first before exporting.")
+            return
+
+        categories = self._sr_categories
+        daily_data = self._sr_report_data
+        month_label = self._sr_month_label
+
+        if not os.path.exists(SALESREPORT_FOLDER):
+            os.makedirs(SALESREPORT_FOLDER)
+
+        safe_label = month_label.replace(" ", "_")
+        xlsx_fname = f"SalesReport_{safe_label}.xlsx"
+        pdf_fname = f"SalesReport_{safe_label}.pdf"
+        xlsx_path = os.path.join(SALESREPORT_FOLDER, xlsx_fname)
+        pdf_path = os.path.join(SALESREPORT_FOLDER, pdf_fname)
+
+        # --- Generate XLSX ---
+        xlsx_ok = self._generate_sales_report_xlsx(categories, daily_data, month_label, xlsx_path)
+        if not xlsx_ok:
+            return
+
+        # --- Generate PDF ---
+        pdf_ok = self._generate_sales_report_pdf(categories, daily_data, month_label, pdf_path)
+        if not pdf_ok:
+            return
+
+        # --- Increment email counter and save ---
+        self.data_manager.summary_count += 1
+        self.data_manager.save_ledger()
+
+        # --- Send via email ---
+        recipient = self.data_manager.config.get("recipient_email", "").strip()
+        if not recipient:
+            recipient = SENDER_EMAIL
+
+        self.email_manager.trigger_summary_email(
+            recipient=recipient,
+            summary_pdf_path=pdf_path,
+            ledger_path=LEDGER_FILE,
+            business_name=self.data_manager.business_name,
+            count=self.data_manager.summary_count,
+            user=self.session_user,
+            extra_body=f"Sales Report for {month_label}.\n",
+            extra_attachments=[xlsx_path]
+        )
+
+        messagebox.showinfo(
+            "Export & Send Success",
+            f"Sales Report exported and sent via email.\n\n"
+            f"XLSX: {xlsx_path}\n"
+            f"PDF: {pdf_path}\n"
+            f"Email Counter: {self.data_manager.summary_count:04d}"
+        )
+
+    def _generate_sales_report_xlsx(self, categories, daily_data, month_label, full_path):
+        """Internal: generates the XLSX file. Returns True on success."""
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+            from openpyxl.utils import get_column_letter
+        except ImportError:
+            messagebox.showerror("Error", "openpyxl library is not available.")
+            return False
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Sales Report"
+
+        # --- Styles ---
+        header_font = Font(name="Segoe UI", bold=True, size=11, color="FFFFFF")
+        header_fill = PatternFill(start_color="1B5E20", end_color="1B5E20", fill_type="solid")
+        header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        total_font = Font(name="Segoe UI", bold=True, size=10)
+        total_fill = PatternFill(start_color="C8E6C9", end_color="C8E6C9", fill_type="solid")
+        data_font = Font(name="Segoe UI", size=10)
+        currency_fmt = '#,##0.00'
+        thin_border = Border(
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'), bottom=Side(style='thin')
+        )
+
+        # --- Title Row ---
+        title_text = f"Sales Report - {month_label} - {self.data_manager.business_name}"
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=4 + len(categories))
+        title_cell = ws.cell(row=1, column=1, value=title_text)
+        title_cell.font = Font(name="Segoe UI", bold=True, size=14, color="1B5E20")
+        title_cell.alignment = Alignment(horizontal="center")
+
+        # --- Header Row ---
+        headers = ["Date"] + categories + ["Daily Total Sales", "Daily Total Discount", "Customers"]
+        header_row = 3
+        for col_idx, header in enumerate(headers, 1):
+            cell = ws.cell(row=header_row, column=col_idx, value=header)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_alignment
+            cell.border = thin_border
+
+        # --- Data Rows ---
+        sorted_dates = sorted(daily_data.keys())
+        month_total_sales = 0.0
+        month_total_discount = 0.0
+        month_total_customers = 0
+        month_cat_totals = {cat: 0.0 for cat in categories}
+
+        for row_offset, date_str in enumerate(sorted_dates):
+            day = daily_data[date_str]
+            row_num = header_row + 1 + row_offset
+
+            try:
+                dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+                display_date = dt.strftime("%b %d, %a")
+            except ValueError:
+                display_date = date_str
+
+            cell = ws.cell(row=row_num, column=1, value=display_date)
+            cell.font = data_font
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal="center")
+
+            for i, cat in enumerate(categories):
+                cat_val = day['cat_sales'].get(cat, 0.0)
+                month_cat_totals[cat] += cat_val
+                cell = ws.cell(row=row_num, column=2 + i, value=cat_val if cat_val > 0 else None)
+                cell.font = data_font
+                cell.number_format = currency_fmt
+                cell.border = thin_border
+                cell.alignment = Alignment(horizontal="right")
+
+            cell = ws.cell(row=row_num, column=2 + len(categories), value=day['total_sales'])
+            cell.font = data_font
+            cell.number_format = currency_fmt
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal="right")
+
+            disc_val = day['total_discount'] if day['total_discount'] > 0 else None
+            cell = ws.cell(row=row_num, column=3 + len(categories), value=disc_val)
+            cell.font = data_font
+            cell.number_format = currency_fmt
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal="right")
+
+            cell = ws.cell(row=row_num, column=4 + len(categories), value=day['customers'])
+            cell.font = data_font
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal="center")
+
+            month_total_sales += day['total_sales']
+            month_total_discount += day['total_discount']
+            month_total_customers += day['customers']
+
+        # --- Totals Row ---
+        totals_row_num = header_row + 1 + len(sorted_dates)
+        cell = ws.cell(row=totals_row_num, column=1, value="MONTHLY TOTAL")
+        cell.font = total_font
+        cell.fill = total_fill
+        cell.border = thin_border
+        cell.alignment = Alignment(horizontal="center")
+
+        for i, cat in enumerate(categories):
+            val = month_cat_totals[cat]
+            cell = ws.cell(row=totals_row_num, column=2 + i, value=val if val > 0 else None)
+            cell.font = total_font
+            cell.fill = total_fill
+            cell.number_format = currency_fmt
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal="right")
+
+        cell = ws.cell(row=totals_row_num, column=2 + len(categories), value=month_total_sales)
+        cell.font = total_font
+        cell.fill = total_fill
+        cell.number_format = currency_fmt
+        cell.border = thin_border
+        cell.alignment = Alignment(horizontal="right")
+
+        cell = ws.cell(row=totals_row_num, column=3 + len(categories),
+                       value=month_total_discount if month_total_discount > 0 else None)
+        cell.font = total_font
+        cell.fill = total_fill
+        cell.number_format = currency_fmt
+        cell.border = thin_border
+        cell.alignment = Alignment(horizontal="right")
+
+        cell = ws.cell(row=totals_row_num, column=4 + len(categories), value=month_total_customers)
+        cell.font = total_font
+        cell.fill = total_fill
+        cell.border = thin_border
+        cell.alignment = Alignment(horizontal="center")
+
+        # --- Column Widths ---
+        ws.column_dimensions[get_column_letter(1)].width = 14
+        for i in range(len(categories)):
+            ws.column_dimensions[get_column_letter(2 + i)].width = 16
+        ws.column_dimensions[get_column_letter(2 + len(categories))].width = 18
+        ws.column_dimensions[get_column_letter(3 + len(categories))].width = 20
+        ws.column_dimensions[get_column_letter(4 + len(categories))].width = 12
+
+        try:
+            wb.save(full_path)
+            return True
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to save XLSX: {e}")
+            return False
+
+    def _generate_sales_report_pdf(self, categories, daily_data, month_label, full_path):
+        """Internal: generates the PDF file (A4 Landscape). Returns True on success."""
+        try:
+            canvas_mod = self.mod.canvas
+            inch = self.mod.inch
+            from reportlab.lib.pagesizes import A4, landscape
+            from reportlab.lib.colors import HexColor
+        except ImportError:
+            messagebox.showerror("Error", "reportlab library is not available.")
+            return False
+
+        try:
+            page_size = landscape(A4)
+            width, height = page_size
+            c = canvas_mod.Canvas(full_path, pagesize=page_size)
+
+            # Margins
+            left_margin = 0.5 * inch
+            right_margin = width - 0.5 * inch
+            top_margin = height - 0.5 * inch
+            usable_width = right_margin - left_margin
+
+            # --- Calculate column widths ---
+            num_cat = len(categories)
+            date_w = 1.1 * inch
+            total_sales_w = 1.1 * inch
+            total_disc_w = 1.1 * inch
+            customers_w = 0.8 * inch
+            fixed_w = date_w + total_sales_w + total_disc_w + customers_w
+            remaining_w = usable_width - fixed_w
+
+            if num_cat > 0:
+                cat_w = max(remaining_w / num_cat, 0.8 * inch)
+            else:
+                cat_w = 0
+
+            # Build column positions
+            col_positions = [left_margin]
+            x = left_margin + date_w
+            for i in range(num_cat):
+                col_positions.append(x)
+                x += cat_w
+            col_positions.append(x)  # Total Sales
+            x += total_sales_w
+            col_positions.append(x)  # Total Discount
+            x += total_disc_w
+            col_positions.append(x)  # Customers
+
+            headers = ["Date"] + categories + ["Total Sales", "Total Discount", "Customers"]
+
+            def draw_page_header(y_pos):
+                c.setFont("Helvetica-Bold", 14)
+                c.setFillColor(HexColor("#1B5E20"))
+                c.drawString(left_margin, y_pos, f"Sales Report - {month_label} - {self.data_manager.business_name}")
+                y_pos -= 6
+                c.setFont("Helvetica", 8)
+                c.setFillColor(HexColor("#555555"))
+                c.drawString(left_margin, y_pos - 10,
+                             f"Generated: {get_current_time().strftime('%Y-%m-%d %H:%M:%S')}")
+                y_pos -= 28
+
+                header_h = 18
+                c.setFillColor(HexColor("#1B5E20"))
+                c.rect(left_margin, y_pos - header_h + 4, usable_width, header_h, fill=1, stroke=0)
+
+                c.setFillColor(HexColor("#FFFFFF"))
+                c.setFont("Helvetica-Bold", 7 if num_cat > 4 else 8)
+                for i, hdr in enumerate(headers):
+                    x_pos = col_positions[i] + 3
+                    c.drawString(x_pos, y_pos - 10, hdr)
+
+                y_pos -= header_h
+                return y_pos
+
+            def draw_row(y_pos, values, is_total=False):
+                row_h = 16
+                if is_total:
+                    c.setFillColor(HexColor("#C8E6C9"))
+                    c.rect(left_margin, y_pos - row_h + 4, usable_width, row_h, fill=1, stroke=0)
+                    c.setFillColor(HexColor("#1B5E20"))
+                    c.setFont("Helvetica-Bold", 8)
+                else:
+                    c.setFillColor(HexColor("#000000"))
+                    c.setFont("Helvetica", 8)
+
+                for i, val in enumerate(values):
+                    x_pos = col_positions[i] + 3
+                    c.drawString(x_pos, y_pos - 10, str(val))
+
+                c.setStrokeColor(HexColor("#CCCCCC"))
+                c.setLineWidth(0.3)
+                c.line(left_margin, y_pos - row_h + 4, left_margin + usable_width, y_pos - row_h + 4)
+                return y_pos - row_h
+
+            # --- Build rows ---
+            sorted_dates = sorted(daily_data.keys())
+            data_rows = []
+            month_total_sales = 0.0
+            month_total_discount = 0.0
+            month_total_customers = 0
+            month_cat_totals = {cat: 0.0 for cat in categories}
+
+            for date_str in sorted_dates:
+                day = daily_data[date_str]
+                try:
+                    dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+                    display_date = dt.strftime("%b %d, %a")
+                except ValueError:
+                    display_date = date_str
+
+                row = [display_date]
+                for cat in categories:
+                    cat_val = day['cat_sales'].get(cat, 0.0)
+                    month_cat_totals[cat] += cat_val
+                    row.append(f"{cat_val:,.2f}" if cat_val > 0 else "-")
+                row.append(f"{day['total_sales']:,.2f}")
+                row.append(f"{day['total_discount']:,.2f}" if day['total_discount'] > 0 else "-")
+                row.append(str(day['customers']))
+
+                month_total_sales += day['total_sales']
+                month_total_discount += day['total_discount']
+                month_total_customers += day['customers']
+                data_rows.append(row)
+
+            total_row = ["MONTHLY TOTAL"]
+            for cat in categories:
+                val = month_cat_totals[cat]
+                total_row.append(f"{val:,.2f}" if val > 0 else "-")
+            total_row.append(f"{month_total_sales:,.2f}")
+            total_row.append(f"{month_total_discount:,.2f}" if month_total_discount > 0 else "-")
+            total_row.append(str(month_total_customers))
+
+            # --- Render Pages ---
+            y = top_margin
+            y = draw_page_header(y)
+            row_h = 16
+
+            for row in data_rows:
+                if y - row_h < 0.5 * inch:
+                    c.showPage()
+                    y = top_margin
+                    y = draw_page_header(y)
+                y = draw_row(y, row, is_total=False)
+
+            if y - row_h < 0.5 * inch:
+                c.showPage()
+                y = top_margin
+                y = draw_page_header(y)
+            draw_row(y, total_row, is_total=True)
+
+            c.save()
+            return True
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to generate PDF: {e}")
+            return False
 
     # --- SETTINGS TAB ---
     def setup_settings_tab(self):
@@ -3661,63 +4521,145 @@ class POSSystem:
         self.settings_notebook.add(self.tab_settings_general, text="General")
         self.settings_notebook.add(self.tab_settings_web, text="Web Server")
 
-        # General
-        f = ttk.LabelFrame(self.tab_settings_general, text="Settings")
-        f.pack(fill="both", expand=True, padx=10, pady=10)
+        # Create a scrollable frame for the general settings to handle many items
+        canvas = tk.Canvas(self.tab_settings_general, borderwidth=0, background=PASTEL_GREEN_BG)
+        scrollbar = ttk.Scrollbar(self.tab_settings_general, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(
+                scrollregion=canvas.bbox("all")
+            )
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Container for all sections
+        f = ttk.Frame(scrollable_frame, padding=10)
+        f.pack(fill="both", expand=True)
+
+        # 1. APPLICATION SETTINGS
+        app_f = ttk.LabelFrame(f, text="Application Settings")
+        app_f.pack(fill="x", padx=10, pady=5)
 
         self.chk_startup_var = tk.BooleanVar(value=self.data_manager.config.get("startup", False))
-        ttk.Checkbutton(f, text="Launch at Startup", variable=self.chk_startup_var, command=self.toggle_startup).pack(pady=5, anchor="w")
+        ttk.Checkbutton(app_f, text="Launch at Startup", variable=self.chk_startup_var, command=self.toggle_startup).pack(pady=10, padx=10, anchor="w")
 
-        self.chk_touch_var = tk.BooleanVar(value=self.touch_mode)
-        ttk.Checkbutton(f, text="Enable Touch Mode (Larger UI)", variable=self.chk_touch_var, command=self.toggle_touch_mode).pack(pady=5, anchor="w")
-
-        ttk.Separator(f, orient='horizontal').pack(fill='x', pady=10)
-        ttk.Label(f, text="Email Receipt Sync", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-
-        email_frame = ttk.Frame(f)
-        email_frame.pack(anchor="w", pady=5, fill="x")
-        ttk.Label(email_frame, text="Recipient Email:").pack(side="left")
-        self.entry_email = ttk.Entry(email_frame, width=35)
+        # 2. EMAIL SYNC
+        email_f = ttk.LabelFrame(f, text="Email Receipt Sync")
+        email_f.pack(fill="x", padx=10, pady=5)
+        
+        ttk.Label(email_f, text="Automatically send receipts and summaries to this address:", font=("Segoe UI", 9)).pack(anchor="w", padx=10, pady=(5,0))
+        
+        email_entry_frame = ttk.Frame(email_f)
+        email_entry_frame.pack(anchor="w", pady=10, padx=10, fill="x")
+        ttk.Label(email_entry_frame, text="Recipient Email:").pack(side="left")
+        self.entry_email = ttk.Entry(email_entry_frame, width=35)
         self.entry_email.insert(0, self.data_manager.config.get("recipient_email", ""))
         self.entry_email.pack(side="left", padx=5)
-        ttk.Button(email_frame, text="Confirm & Test", command=self.verify_and_test_email).pack(side="left", padx=5)
+        ttk.Button(email_entry_frame, text="Confirm & Test", command=self.verify_and_test_email).pack(side="left", padx=5)
 
-        ttk.Separator(f, orient='horizontal').pack(fill='x', pady=10)
-        ttk.Label(f, text="Visuals", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        ttk.Label(f, text="Splash Image:").pack(pady=(5, 0), anchor="w")
-        self.entry_img = ttk.Entry(f, width=40)
-        self.entry_img.insert(0, self.data_manager.config.get("splash_img", ""))
-        self.entry_img.pack(pady=2, anchor="w")
-        ttk.Button(f, text="Browse", command=self.browse_splash).pack(pady=2, anchor="w")
-        ttk.Button(f, text="Save Visual Settings", command=self.save_display_settings).pack(pady=5, anchor="w")
+        # Helper to create setting rows with descriptions
+        def add_setting_row(parent, title, description, button_text, command, warning=None, danger=False):
+            container = ttk.Frame(parent)
+            container.pack(fill="x", padx=10, pady=8)
+            
+            # Left side: Text
+            text_frame = ttk.Frame(container)
+            text_frame.pack(side="left", fill="both", expand=True)
+            
+            ttk.Label(text_frame, text=title, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+            desc_label = ttk.Label(text_frame, text=description, font=("Segoe UI", 9), wraplength=500)
+            desc_label.pack(anchor="w")
+            
+            # Right side: Button
+            btn_style = "Danger.TButton" if danger else "TButton"
+            
+            def wrapped_cmd():
+                confirm_title = f"Confirm Action: {title}"
+                msg = f"{description}\n\n"
+                if warning:
+                    msg += f"WARNING: {warning}\n\n"
+                msg += "Do you want to proceed?"
+                
+                if messagebox.askyesno(confirm_title, msg, icon='warning' if (danger or warning) else 'question'):
+                    command()
 
-        ttk.Separator(f, orient='horizontal').pack(fill='x', pady=10)
-        ttk.Label(f, text="Backup / Restore", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        bf = ttk.Frame(f)
-        bf.pack(anchor="w", pady=5)
-        ttk.Button(bf, text="Backup (.json)", command=self.backup_data_json).pack(side="left", padx=5)
-        ttk.Button(bf, text="Restore (.json)", command=self.restore_data_json).pack(side="left", padx=5)
-        ttk.Button(bf, text="View Beginning Inventory", command=self.view_today_bi).pack(side="left", padx=5)
+            btn = ttk.Button(container, text=button_text, command=wrapped_cmd, style=btn_style, width=20)
+            btn.pack(side="right", padx=10)
+            return container
 
-        ttk.Separator(f, orient='horizontal').pack(fill='x', pady=10)
-        ttk.Label(f, text="Maintenance", font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        mf = ttk.Frame(f)
-        mf.pack(anchor="w", pady=5)
-        ttk.Button(mf, text="Harmonize Receipts", command=lambda: self.harmonize_receipts(silent=False)).pack(side="left", padx=5)
-        ttk.Button(mf, text="Harmonize Usernames", command=self.harmonize_usernames).pack(side="left", padx=5)
-        ttk.Button(mf, text="Export Stock (XLSX)", command=self.export_stock_xlsx).pack(side="left", padx=5)
-        ttk.Button(mf, text="Restore Products File", command=self.regenerate_products_file).pack(side="left", padx=5)
-        ttk.Button(mf, text="Smart Cleanup", command=self.smart_cleanup).pack(side="left", padx=5)
+        # 3. BACKUP & RESTORE
+        br_f = ttk.LabelFrame(f, text="Backup / Restore")
+        br_f.pack(fill="x", padx=10, pady=5)
 
-        ttk.Separator(f, orient='horizontal').pack(fill='x', pady=10)
-        ttk.Button(f, text="Load Test (Dev)", command=self.run_load_test, style="Danger.TButton").pack(anchor="w", pady=5)
-        ttk.Button(f, text="Delete All Data", command=self.delete_all_data, style="Danger.TButton").pack(anchor="w", pady=5)
+        add_setting_row(br_f, "Backup Ledger", 
+                        "Creates a backup of the entire transaction ledger and products to a JSON file.",
+                        "Backup (.json)", self.backup_data_json)
+        
+        add_setting_row(br_f, "Restore Ledger", 
+                        "Restores data from a previously created JSON backup.",
+                        "Restore (.json)", self.restore_data_json,
+                        warning="This will OVERWRITE your current transactions and products! A restart will be required.")
+        
+        add_setting_row(br_f, "Beginning Inventory", 
+                        "Generates and opens today's Beginning Inventory report based on the current ledger.",
+                        "View Today's BI", self.view_today_bi)
+
+        # 4. MAINTENANCE
+        m_f = ttk.LabelFrame(f, text="System Maintenance")
+        m_f.pack(fill="x", padx=10, pady=5)
+
+        add_setting_row(m_f, "Harmonize Receipts", 
+                        "Ensures all internal record counters match the actual saved receipt files. Recommended if you notice missing logs.",
+                        "Harmonize Now", lambda: self.harmonize_receipts(silent=False),
+                        warning="This will scan all receipt folders and may take a moment depending on the number of files.")
+        
+        add_setting_row(m_f, "Recover Usernames", 
+                        "Recovers missing cashier/user information in the ledger by scanning existing PDF receipts.",
+                        "Harmonize Usernames", self.harmonize_usernames)
+        
+        add_setting_row(m_f, "Current Stock Export", 
+                        "Exports current inventory levels (Category, Name, Quantity) to an Excel file.",
+                        "Export Stock (.xlsx)", self.export_stock_xlsx)
+        
+        add_setting_row(m_f, "Restore Products File", 
+                        "Restore the products database from the latest automatic backup. Use if the current file is corrupted.",
+                        "Restore Backup", self.regenerate_products_file,
+                        warning="CAUTION: This will overwrite your current 'products.xlsx' with the latest backup. Any unsaved changes since the last backup will be lost.")
+        
+        add_setting_row(m_f, "Smart Cleanup (AI)", 
+                        "Uses intelligent logic (and AI if enabled) to clean and standardize product names.",
+                        "Start Smart Cleanup", self.smart_cleanup,
+                        warning="This will modify product names in both the Excel file and the transaction database.")
+
+        po_f = ttk.LabelFrame(f, text="Phased Out Products")
+        po_f.pack(fill="x", padx=10, pady=5)
+        
+        add_setting_row(po_f, "Clear Inventory", 
+                        "Review and clear existing stock of phased-out products (products removed from products.xlsx). An email report will be sent.",
+                        "Manage Items", self.manage_phased_out_products)
+
+        # 5. DANGER ZONE
+        d_f = ttk.LabelFrame(f, text="Danger Zone")
+        d_f.pack(fill="x", padx=10, pady=5)
+        
+        add_setting_row(d_f, "Factory Reset", 
+                        "WIPES all transaction data, receipts, and configuration. USE WITH EXTREME CAUTION.",
+                        "DELETE ALL DATA", self.delete_all_data,
+                        warning="This is IRREVERSIBLE. Only products.xlsx and the program itself will remain.",
+                        danger=True)
 
         # Web Server Panel
         self.setup_web_server_panel(self.tab_settings_web)
 
     def view_today_bi(self):
-        today_str = datetime.datetime.now().strftime('%Y%m%d')
+        today_str = get_current_time().strftime('%Y%m%d')
         fname = f"BI-{today_str}.pdf"
         full_path = os.path.join(SUMMARY_FOLDER, fname)
         
@@ -3766,28 +4708,22 @@ class POSSystem:
         self.data_manager.config["recipient_email"] = email_input
         self.data_manager.save_config()
 
-        subject = f"Receipt Sync Confirmation - {APP_TITLE}"
-        body = f"This email has been entered as recipient for {APP_TITLE} receipts by {self.session_user}."
+        date_str = get_current_time().strftime("%Y-%m-%d %H:%M:%S")
+        subject = f"{self.data_manager.business_name} - System Sync Test ({get_current_time().strftime('%Y-%m-%d')})"
+        body = (
+            f"Hello,\n\n"
+            f"This is an automated test email to confirm that your recipient email address has been successfully configured for {self.data_manager.business_name}.\n\n"
+            f"--- Details ---\n"
+            f"Configured By: {self.session_user}\n"
+            f"Date & Time:   {date_str}\n"
+            f"---------------\n\n"
+            f"You will now automatically receive inventory reports, daily summaries, and ledger backups at this address.\n\n"
+            f"Best regards,\n"
+            f"{APP_TITLE}"
+        )
         self.email_manager.send_email_thread(email_input, subject, body, is_test=True,
                                              on_success=lambda: messagebox.showinfo("Success", "Test email sent."),
                                              on_error=lambda e: messagebox.showerror("Error", str(e)))
-
-    def browse_splash(self):
-        path = filedialog.askopenfilename(filetypes=[("Image Files", "*.jpg *.png")])
-        if path: self.entry_img.delete(0, tk.END); self.entry_img.insert(0, path)
-
-    def save_display_settings(self):
-        self.data_manager.config["splash_img"] = self.entry_img.get()
-        self.data_manager.save_config()
-        messagebox.showinfo("Success", "Saved.")
-
-    def toggle_touch_mode(self):
-        enabled = self.chk_touch_var.get()
-        self.data_manager.config["touch_mode"] = enabled
-        self.data_manager.save_config()
-        self.style_manager.set_touch_mode(enabled)
-        # Note: full effect requires restart, but we can try to re-apply styles
-        messagebox.showinfo("Restart Required", "Please restart the application for Touch Mode changes to fully take effect.")
 
     def toggle_startup(self):
         startup_folder = os.path.join(os.getenv("APPDATA"), r"Microsoft\Windows\Start Menu\Programs\Startup")
@@ -3809,6 +4745,114 @@ class POSSystem:
             self.data_manager.config["startup"] = False
             self.data_manager.save_config()
             messagebox.showinfo("Startup", "Disabled.")
+
+    def manage_phased_out_products(self):
+        phased_out = []
+        names_in_excel = set(self.data_manager.products_df['Product Name'].astype(str))
+        for name, st in self.data_manager.stock_cache.items():
+            stock = st['in'] - st['out']
+            if name not in names_in_excel and stock != 0:
+                phased_out.append({"name": name, "stock": stock})
+                
+        if not phased_out:
+            messagebox.showinfo("Info", "No phased out products with existing stock found.")
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Clear Phased Out Products")
+        win.geometry("500x400")
+        
+        ttk.Label(win, text="Select phased out products to clear their stock:", font=("Segoe UI", 10, "bold")).pack(pady=10)
+        
+        canvas = tk.Canvas(win)
+        scrollbar = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(
+                scrollregion=canvas.bbox("all")
+            )
+        )
+
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        
+        canvas.pack(side="top", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        
+        vars_dict = {}
+        for item in phased_out:
+            var = tk.BooleanVar(value=False)
+            vars_dict[item['name']] = (var, item['stock'])
+            cb = ttk.Checkbutton(scrollable_frame, text=f"{item['name']} (Stock: {item['stock']})", variable=var)
+            cb.pack(anchor="w", padx=10, pady=2)
+            
+        def on_confirm():
+            to_clear = [name for name, (var, qty) in vars_dict.items() if var.get()]
+            if not to_clear:
+                messagebox.showinfo("Info", "No products selected.")
+                return
+                
+            if messagebox.askyesno("Confirm", f"Are you sure you want to clear the stock of {len(to_clear)} phased out product(s)?"):
+                action_items = []
+                for name in to_clear:
+                    stock = vars_dict[name][1]
+                    action_items.append({
+                        "name": name,
+                        "qty": -stock,
+                        "price": 0,
+                        "category": "Phased Out"
+                    })
+                    
+                now = get_current_time()
+                date_str = now.strftime('%Y-%m-%d %H:%M:%S')
+                fname = f"PhasedOutClear_{now.strftime('%Y%m%d-%H%M%S')}"
+                
+                self.data_manager.add_transaction("inventory", fname, action_items, date_str, user=self.session_user)
+                self.data_manager.refresh_stock_cache()
+                # Phased out items don't appear in standard UI dropdowns, so no UI refresh needed here 
+                
+                email_text = (
+                    f"Hello,\n\n"
+                    f"This is an automated notification regarding phased-out product inventory for {self.data_manager.business_name}.\n\n"
+                    f"--- Details ---\n"
+                    f"Action By:   {self.session_user}\n"
+                    f"Date & Time: {date_str}\n"
+                    f"---------------\n\n"
+                    f"The following phased-out products have had their remaining stock cleared from the system:\n\n"
+                )
+                for name in to_clear:
+                    email_text += f"- {name} (Cleared stock: {vars_dict[name][1]})\n"
+                
+                email_text += f"\nBest regards,\n{APP_TITLE}"
+                    
+                recipient = self.data_manager.config.get("recipient_email", "").strip() or SENDER_EMAIL
+                subject = f"{self.data_manager.business_name} - Phased Out Stock Cleared ({now.strftime('%Y-%m-%d')})"
+                
+                def on_fail(err):
+                    record = {
+                        "timestamp": date_str,
+                        "subject": subject,
+                        "body": email_text,
+                        "files": []
+                    }
+                    self.data_manager.offline_receipts.append(record)
+                    self.data_manager.save_ledger()
+
+                self.email_manager.send_email_thread(
+                    recipient, subject, email_text, [],
+                    on_error=on_fail
+                )
+                
+                messagebox.showinfo("Success", f"Cleared {len(to_clear)} phased out product(s).")
+                win.destroy()
+                
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill="x", pady=10)
+        
+        ttk.Button(btn_frame, text="Confirm", command=on_confirm).pack(side="right", padx=10)
+        ttk.Button(btn_frame, text="Cancel", command=win.destroy).pack(side="right")
 
     def backup_data_json(self):
         if not self.data_manager.ledger:
@@ -4041,7 +5085,7 @@ class POSSystem:
                 {"name": row['Product Name'], "price": float(row['Price']), "category": row['Product Category']})
 
         stock_tracker = {p['name']: 0 for p in products}
-        start_date = datetime.datetime.now() - datetime.timedelta(days=30)
+        start_date = get_current_time() - datetime.timedelta(days=30)
 
         try:
             for day_offset in range(31):
@@ -4435,10 +5479,20 @@ class POSSystem:
     def export_stock_xlsx(self):
         # Category, Product Name, Stock
         rows = []
+        known_names = set(p['Product Name'] for p in self.data_manager.get_product_list())
+
         for name in list(self.data_manager.stock_cache.keys()):
             stk = self.data_manager.get_stock_level(name)
+            if name not in known_names and stk <= 0:
+                continue
+
             details = self.data_manager.get_product_details_by_str(name)
             cat = details[3] if details else "Uncategorized"
+            if cat == "Phased Out":
+                # Ensure it clearly says Old
+                if not name.endswith("(Old)"):
+                    name += " (Old)"
+
             rows.append({
                 "Category": cat,
                 "Product Name": name,
@@ -4721,7 +5775,7 @@ class POSSystem:
         items = data.get('items', [])
 
         if not items: return
-        now = datetime.datetime.now()
+        now = get_current_time()
 
         request_id = secrets.token_hex(4)
         request_data = {
@@ -4862,13 +5916,13 @@ class POSSystem:
             pass
 
     def check_beginning_inventory_reminder(self):
-        today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        today_str = get_current_time().strftime("%Y-%m-%d")
         last_bi_date = self.data_manager.last_bi_date
         if last_bi_date != today_str:
             self.generate_beginning_inventory_report()
 
     def generate_beginning_inventory_report(self, silent: bool = False):
-        today = datetime.datetime.now()
+        today = get_current_time()
         today_str = today.strftime("%Y-%m-%d")
 
         # Capture current state (Beginning Inventory)
@@ -4937,13 +5991,22 @@ class POSSystem:
             if not recipient:
                 recipient = SENDER_EMAIL
 
-            safe_biz_name = "".join(c for c in self.data_manager.business_name if c.isalnum() or c in (' ', '_', '-')).strip()
-            subject = f"Beginning Inventory - {safe_biz_name} - {today_str}"
-            body = (f"Beginning Inventory Report.\n\n"
-                    f"User: {self.session_user}\n"
-                    f"Counter: {self.data_manager.summary_count:04d}\n"
-                    f"Date: {today_str}\n\n"
-                    f"Please find the Beginning Inventory PDF, Ledger database, and yesterday's Daily Summary (if available) attached.")
+            subject = f"[{self.data_manager.summary_count:04d}] {self.data_manager.business_name} - Beginning Inventory & Daily Summary ({today_str})"
+            body = (
+                f"Hello,\n\n"
+                f"This is the automated Beginning Inventory report and data synchronization for {self.data_manager.business_name}.\n\n"
+                f"--- Details ---\n"
+                f"Active User:   {self.session_user}\n"
+                f"Email Counter: {self.data_manager.summary_count:04d}\n"
+                f"Date & Time:   {get_current_time().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"---------------\n\n"
+                f"Attached to this email, please find:\n"
+                f"- Today's Beginning Inventory PDF\n"
+                f"- The most recent Ledger Database Backup (ledger.json)\n"
+                f"- Yesterday's Daily Summary PDF (if available)\n\n"
+                f"Best regards,\n"
+                f"{APP_TITLE}"
+            )
 
             def on_email_error(err):
                 print(f"Beginning Inventory email failed, storing for catchup: {err}")

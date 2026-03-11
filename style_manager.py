@@ -16,23 +16,18 @@ TOUCH_PADDING = 10
 NORMAL_PADDING = 2
 
 class StyleManager:
-    def __init__(self, root, touch_mode=False):
+    def __init__(self, root):
         self.root = root
-        self.touch_mode = touch_mode
         self.style = ttk.Style(root)
-        self.apply_theme()
-
-    def set_touch_mode(self, enabled):
-        self.touch_mode = enabled
         self.apply_theme()
 
     def apply_theme(self):
         self.style.theme_use('clam')
 
-        # Dimensions based on touch mode
-        base_font_size = 14 if self.touch_mode else 10
-        base_padding = TOUCH_PADDING if self.touch_mode else NORMAL_PADDING
-        row_height = 40 if self.touch_mode else 25
+        # Normal dimensions
+        base_font_size = 10
+        base_padding = NORMAL_PADDING
+        row_height = 25
 
         base_font = ("Segoe UI", base_font_size)
         bold_font = ("Segoe UI", base_font_size, "bold")
@@ -79,10 +74,6 @@ class StyleManager:
         self.style.configure("Inventory.TLabel", background=PASTEL_ORANGE_BG, foreground=PASTEL_ORANGE_FG)
         self.style.configure("Inventory.TLabelframe", background=PASTEL_ORANGE_BG, foreground=PASTEL_ORANGE_FG)
         self.style.configure("Inventory.TLabelframe.Label", background=PASTEL_ORANGE_BG, foreground=PASTEL_ORANGE_FG, font=bold_font)
-
-        # Since buttons and other widgets might sit on the orange background, we might need styles for them too
-        # But 'clam' theme buttons usually have their own background.
-        # However, labels need to match the parent frame.
 
         # Sales (Green Theme - Default, but explicit)
         self.style.configure("Sales.TFrame", background=PASTEL_GREEN_BG)
