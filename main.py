@@ -20,10 +20,11 @@ from style_manager import StyleManager, PASTEL_GREEN_BG, PASTEL_GREEN_ACCENT, PA
 
 # pyinstaller --onefile --noconsole --splash splash_image3.png main.py
 
+
 # --- CONFIGURATION CONSTANTS ---
-GEMINI_API_KEY = "" # Replace with your Gemini API Key here if you want Smart Cleanup to use AI.
 
 APP_DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "MMD_POS_System")
+
 BACKUP_DIR = os.path.join(APP_DATA_DIR, "backups")
 
 # Ensure app data directories exist
@@ -40,7 +41,7 @@ SALESREPORT_FOLDER = "salesreport"
 DATA_FILE = "products.xlsx"
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
 LEDGER_FILE = os.path.join(APP_DATA_DIR, "ledger.json")
-APP_TITLE = "MMD Inventory Tracker v16.10"  # Refactored Version
+APP_TITLE = "MMD Inventory Tracker v16.12"  # Refactored Version
 
 # --- EMAIL CONFIGURATION ---
 SMTP_SERVER = "smtp.gmail.com"
@@ -570,10 +571,10 @@ class DataManager:
         self.refresh_stock_cache()
 
     def refresh_stock_cache(self) -> None:
-        self.stock_cache, _, _, _ = self.calculate_stats(None)
+        self.stock_cache, _, _, _, _ = self.calculate_stats(None)
 
     def calculate_stats(self, period_filter: Optional[Tuple[datetime.datetime, datetime.datetime]]) \
-            -> Tuple[Dict, int, int, List[str]]:
+            -> Tuple[Dict, int, int, List[str], List[str]]:
         """
         Calculates inventory stats.
         Optimization: We parse dates inside the loop.
@@ -582,27 +583,59 @@ class DataManager:
         in_count = 0
         out_count = 0
         corrections_in_period = []
+        
+        # Time-sensitive rename relevance logic
+        all_renames_ledger = []
+        min_ts_by_pname = {}  # Track earliest appearance of any name in the period
+        rename_fns_in_period = set()
 
+        if self.ledger is None: return stats, 0, 0, [], []
         for transaction in self.ledger:
             try:
                 # Type Check
                 t_type = transaction.get('type')
                 if not t_type: continue
 
+                # Collect all rename events from ledger (globally)
+                if t_type == 'correction' and transaction.get('ref_type') == 'rename':
+                    all_renames_ledger.append({
+                        'ts': transaction.get('timestamp', '0000-00-00 00:00:00'),
+                        'old': transaction.get('old_name', '?'),
+                        'new': transaction.get('new_name', '?'),
+                        'old_cat': transaction.get('old_cat', ''),
+                        'new_cat': transaction.get('new_cat', ''),
+                        'fn': transaction.get('filename', '?')
+                    })
+
                 # Filter by Period
-                if period_filter:
+                is_in_period = True
+                if period_filter is not None:
                     ts_str = transaction.get('timestamp')
                     try:
-                        dt = datetime.datetime.strptime(ts_str, self.date_fmt)
+                        dt = datetime.datetime.strptime(str(ts_str or ""), self.date_fmt)
                     except:
                         dt = get_current_time()
 
                     s, e = period_filter
                     if not (s <= dt <= e):
-                        continue
+                        is_in_period = False
+                
+                if not is_in_period:
+                    continue
+                
+                # Below logic is only for transactions in the period
+                ts_period = transaction.get('timestamp', '0000-00-00 00:00:00')
 
-                    if t_type == 'correction':
-                        corrections_in_period.append(transaction.get('filename', 'Unknown'))
+                # Below logic is only for transactions in the period (if filter active)
+                if t_type == 'correction':
+                    fname = transaction.get('filename', 'Unknown')
+                    if transaction.get('ref_type') == 'rename':
+                        old = transaction.get('old_name', '?')
+                        new = transaction.get('new_name', '?')
+                        fname = f"RN:{old}->{new} ({fname})"
+                        rename_fns_in_period.add(transaction.get('filename', '?'))
+                    else:
+                        corrections_in_period.append(fname)
 
                 # Aggregate Logic
                 if t_type == 'inventory':
@@ -614,6 +647,11 @@ class DataManager:
 
                 for item in transaction.get('items', []):
                     name = item.get('name', 'Unknown')
+                    base_name = item.get('base_product', name)
+                    # Track earliest appearance of both specific name and base product in this period
+                    for n_key in {name, base_name}:
+                        if n_key not in min_ts_by_pname or ts_period < min_ts_by_pname[n_key]:
+                            min_ts_by_pname[n_key] = ts_period
                     qty = int(item.get('qty', 0))
                     price = float(item.get('price', 0))
                     item_cat = item.get('category', 'Uncategorized')
@@ -646,7 +684,66 @@ class DataManager:
             except Exception:
                 continue
 
-        return stats, in_count, out_count, corrections_in_period
+        # Post-process: Reverse-chronological historical tracing
+        master_renames = []
+        relevant_renames_fns = set(rename_fns_in_period)
+        
+        # We trace history backwards. If a product in the summary is "C", 
+        # and we find a rename "B -> C" that happened after "C" appeared (or just generally),
+        # then "B" also becomes a relevant name to look for in even older renames.
+        
+        # 1. Sort renames by timestamp (reverse)
+        sorted_renames = sorted(all_renames_ledger, key=lambda x: x['ts'], reverse=True)
+        
+        # 2. Iterate and propagate
+        changed = True
+        while changed:
+            changed = False
+            for r in sorted_renames:
+                if r['fn'] in relevant_renames_fns:
+                    continue
+                
+                old_n = r['old']
+                new_n = r['new']
+                r_ts = r['ts']
+                
+                # Rule: If the NEW name is in our summary, and the rename happened AFTER it first appeared
+                # OR if the OLD name is in our summary and it was renamed later.
+                is_relevant = False
+                if new_n in min_ts_by_pname and r_ts >= min_ts_by_pname[new_n]:
+                    is_relevant = True
+                elif old_n in min_ts_by_pname and r_ts >= min_ts_by_pname[old_n]:
+                    is_relevant = True
+                
+                if is_relevant:
+                    relevant_renames_fns.add(r['fn'])
+                    changed = True
+                    # Propagate timestamp to the other side so we can continue tracing
+                    if old_n not in min_ts_by_pname or r_ts < min_ts_by_pname[old_n]:
+                        min_ts_by_pname[old_n] = r_ts
+                    if new_n not in min_ts_by_pname or r_ts < min_ts_by_pname[new_n]:
+                        min_ts_by_pname[new_n] = r_ts
+
+        # Final build in ledger order
+        added_ids = set()
+        for r in all_renames_ledger:
+            if r['fn'] in relevant_renames_fns and r['fn'] not in added_ids:
+                ts_str_r = str(r['ts']).split(' ', 1)[0]
+                rename_str = f"{ts_str_r} {r['old']}->{r['new']}"
+                
+                # Add Category change if applicable
+                o_cat = r.get('old_cat', '')
+                n_cat = r.get('new_cat', '')
+                if o_cat and n_cat and o_cat != n_cat:
+                    rename_str += f" | {o_cat}->{n_cat}"
+                
+                # Add filename
+                rename_str += f" ({r['fn']})"
+                
+                master_renames.append(rename_str)
+                added_ids.add(r['fn'])
+
+        return stats, in_count, out_count, corrections_in_period, master_renames
 
     def get_product_list(self) -> List[Dict]:
         if self.products_df is None or self.products_df.empty:
@@ -655,12 +752,12 @@ class DataManager:
 
     def get_product_details_by_str(self, selection_string: str) -> Tuple[str, str, float, str]:
         """Returns (code, name, price, category)"""
-        if not selection_string: return "", None, 0, "Uncategorized"
+        if not selection_string: return "", "", 0.0, "Uncategorized"
 
         # Try direct lookup in cache (Exact Full Name or Truncated Name)
         if selection_string in self.name_lookup_cache:
             item = self.name_lookup_cache[selection_string]
-            return "", item['Product Name'], float(item['Price']), item['Product Category']
+            return "", str(item['Product Name']), float(item['Price']), str(item['Product Category'])
 
         # Try parsing "Name (Price)" format
         try:
@@ -763,9 +860,10 @@ class ReportManager:
             content_width = width - (2 * margin)
             
             line_height = 10
-            base_height = 215 # For headers and footers
-            items_height = len(items) * line_height * 2 # 2 lines per item (name, then qty/price/sub)
-            height = base_height + items_height
+            # Precise height: Header(120) + Items(22 each) + Totals(80) + Padding(10)
+            footer_h = 80
+            if kwargs.get('total_discount', 0.0) > 0: footer_h += 12
+            height = 120 + (len(items) * 22) + footer_h + 10
             
             c = canvas.Canvas(filepath, pagesize=(width, height))
             y = height - (0.2 * inch)
@@ -893,7 +991,8 @@ class ReportManager:
     def generate_thermal_summary_receipt(self, filepath: str, title: str, date_str: str, period_str: str, 
                                          aggregated_data: List[Dict], per_trans_data: List[Dict], is_per_trans: bool, 
                                          tot_sales: float, total_cash: float, total_change: float, 
-                                         in_c: int, out_c: int, corr_list: List[str], user: Optional[str] = None) -> bool:
+                                         in_c: int, out_c: int, corr_list: List[str], 
+                                         master_renames: Optional[List[str]] = None, user: Optional[str] = None) -> bool:
         try:
             canvas = self.mod.canvas
             inch = self.mod.inch
@@ -902,44 +1001,98 @@ class ReportManager:
             
             items_list = per_trans_data if is_per_trans else aggregated_data
             
-            base_height = 195
-            total_discount_sum = 0.0
-            if is_per_trans:
-                for pt in per_trans_data:
-                    if pt.get('type') == 'sales':
-                        total_discount_sum += float(pt.get('total_discount', 0.0))
+            base_height = 250
             
-            if total_discount_sum > 0:
-                base_height += 15
-                
+            # --- Wrapping logic to calculate height and display correctly ---
+            max_chars = 32 # Capacity for 8pt Courier on 57mm
+            
+            total_discount_sum = 0.0
+            for pt in (per_trans_data or []):
+                if pt.get('type') == 'sales':
+                    total_discount_sum += float(pt.get('total_discount', 0.0))
+
+            def wrap_txt(txt, limit):
+                s = str(txt)
+                if len(s) <= limit: return [s]
+                res = [s[:limit]]
+                rem = s[limit:]
+                while rem:
+                    res.append("  " + rem[:limit-2])
+                    rem = rem[limit-2:]
+                return res
+
+            wrapped_corrs = []
+            for cr in (corr_list or []):
+                wrapped_corrs.extend(wrap_txt(cr, max_chars))
+            
+            rename_notes = master_renames or []
+            wrapped_renames = []
+            for rn in rename_notes:
+                wrapped_renames.extend(wrap_txt(rn, max_chars))
+
+            current_user = user if user else self.session_user
+            user_line_raw = f"Generated: {date_str} by {current_user}"
+            wrapped_user_header = wrap_txt(user_line_raw, 40)
+
+            # 1. Header Area: Overhead(63.4) + UserLines(len*12) + Internal(10) + Divider(12)
+            calc_h = 63.4 + (len(wrapped_user_header) * 12) + 22
+            
             if is_per_trans:
-                items_height = 0
-                for pt in items_list:
-                    items_height += 12 # Header line
-                    if 'items' in pt:
-                        items_height += len(pt['items']) * 22
+                # Table Header: 10 + Divider(12) = 22
+                calc_h += 22
+                for pt in per_trans_data:
+                    # Header(10)
+                    calc_h += 10
                     if pt.get('type') == 'sales':
-                        if pt.get('cash', 0) > 0 or pt.get('change', 0) > 0:
-                            items_height += 24
-                        if pt.get('total_discount', 0) > 0:
-                            items_height += 10
-                    items_height += 5 # Divider space
+                        # Items(22 each)
+                        calc_h += (len(pt.get('items', [])) * 22)
+                        # Discount(10)
+                        if float(pt.get('total_discount', 0.0)) > 0: calc_h += 10
+                        # Cash/Change(22)
+                        if float(pt.get('cash', 0.0)) > 0 or float(pt.get('change', 0.0)) > 0: calc_h += 22
+                    else: # Inventory
+                        # Items(12 each)
+                        calc_h += (len(pt.get('items', [])) * 12)
+                    
+                    # Gap(5)
+                    calc_h += 5
             else:
-                # Group by category for aggregated view
-                def sort_key(x):
-                    cat = x.get('category', 'Uncategorized')
-                    if cat == "Phased Out": cat = "zzz_Phased Out"
-                    base = x.get('base_name', x.get('name', ''))
-                    is_var = 1 if x.get('is_variant', False) else 0
-                    return (cat, base, is_var, x.get('name', ''))
-                items_list = sorted(items_list, key=sort_key)
-                
-                cats = set(it.get('category', 'Uncategorized') for it in items_list)
-                items_height = (len(items_list) * 22) + (len(cats) * 15)
-            if corr_list:
-                base_height += len(corr_list) * 12 + 30
-                
-            height = base_height + items_height
+                # Table Header: 10 + Divider(12) = 22
+                calc_h += 22
+                current_cat = None
+                for it in aggregated_data:
+                    cat = it.get('category', 'Uncategorized')
+                    if cat != current_cat:
+                        calc_h += 12 # Category label
+                        current_cat = cat
+                    calc_h += 22 # Name(10) + Details(12)
+            
+            # 2. Main Footer
+            # Divider(12) + Total Sales(12) = 24
+            calc_h += 24
+            if total_cash > 0 or total_change != 0:
+                calc_h += 20 # Cash(10) + Change(10)
+                if total_discount_sum > 0: 
+                    calc_h += 15 # Discount line
+                else: 
+                    calc_h += 5 # Else gap
+            
+            # Total Qty (In/Out) line
+            calc_h += 15
+            
+            # 3. Audit Records
+            if wrapped_corrs:
+                # Gap(20) + Header(12) + Lines(10 each) + Gap(5)
+                calc_h += 20 + 12 + (len(wrapped_corrs) * 10) + 5
+            
+            if wrapped_renames:
+                # Gap(20) + Header(10) + Lines(9 each) + Gap(10)
+                calc_h += 20 + 10 + (len(wrapped_renames) * 9) + 10
+            
+            # 4. Final Closure (15 used by text + 10 padding)
+            calc_h += 25
+            
+            height = calc_h
             c = canvas.Canvas(filepath, pagesize=(width, height))
             y = height - (0.2 * inch)
             
@@ -956,9 +1109,11 @@ class ReportManager:
             c.setFont("Helvetica", 7)
             c.drawString(margin, y, f"Period: {period_str}")
             y -= 10
-            current_user = user if user else self.session_user
-            c.drawString(margin, y, f"Generated: {date_str} by {current_user}")
-            y -= 12
+            
+            c.setFont("Helvetica", 7)
+            for u_line in wrapped_user_header:
+                c.drawString(margin, y, u_line)
+                y -= 12
             
             c.setFont("Helvetica", 6)
             c.drawCentredString(width / 2.0, y, "For internal use only.")
@@ -1078,7 +1233,12 @@ class ReportManager:
                     is_var = item.get('is_variant', False)
                     name = str(item.get('name', 'Unknown'))
                     indent = margin + 8 if is_var else margin
-                    if len(name) > 25: name = name[:12] + "..." + name[-10:]
+                    # Use more robust truncation to satisfy linter
+                    d_name = str(name)
+                    if len(d_name) > 25:
+                        name = d_name[:12] + "..." + d_name[-10:]
+                    else:
+                        name = d_name
                     
                     in_v = item.get('in', 0)
                     out_v = item.get('out', 0)
@@ -1124,14 +1284,27 @@ class ReportManager:
             c.drawString(margin, y, f"In: {in_c} | Out: {out_c}")
             y -= 15
             
-            if corr_list:
-                c.setFont("Helvetica-Oblique", 7)
+            if wrapped_corrs:
+                y -= 20
+                c.setFont("Helvetica-Bold", 8)
                 c.drawString(margin, y, "Corrections:")
-                y -= 10
-                for cr in corr_list:
-                    c.drawString(margin + 5, y, f"- {str(cr)[:20]}")
+                y -= 12
+                c.setFont("Courier", 8)
+                for c_line in wrapped_corrs:
+                    c.drawString(margin + 5, y, f"- {c_line}")
                     y -= 10
                 y -= 5
+
+            if wrapped_renames:
+                y -= 20
+                c.setFont("Helvetica-BoldOblique", 7)
+                c.drawString(margin, y, "Master Update Record:")
+                y -= 10
+                c.setFont("Courier", 7)
+                for r_line in wrapped_renames:
+                    c.drawString(margin + 5, y, f"* {r_line}")
+                    y -= 9
+                y -= 10
 
             y -= 15
             c.drawCentredString(width / 2.0, y, "*** END OF RECEIPT ***")
@@ -1154,9 +1327,8 @@ class ReportManager:
             content_width = width - (2 * margin)
             
             line_height = 10
-            base_height = 175  # For headers and footers (shorter as no cash/change needed)
-            items_height = len(items) * line_height * 2  # 2 lines per item (name, then details)
-            height = base_height + items_height
+            # Precise height: Header(97.4) + TableHeader(22) + Items(len*22) + Footer(37) + Safety(10)
+            height = 97.4 + 22 + (len(items) * 22) + 37 + 10
             
             c = canvas.Canvas(filepath, pagesize=(width, height))
             y = height - (0.2 * inch)
@@ -1245,7 +1417,9 @@ class ReportManager:
             
             # --- Footer ---
             c.setFont("Helvetica-Oblique", 7)
-            c.drawCentredString(width / 2.0, y, "Inventory Update Committed Successfully.")
+            c.drawCentredString(width / 2.0, y, "Initial Inventory Recorded.")
+            y -= 12
+            c.drawCentredString(width / 2.0, y, f"Ref: BEGINNING_INV")
             y -= 10
             c.drawCentredString(width / 2.0, y, f"Counter: {self.data_manager.summary_count:04d}" if (self.data_manager and hasattr(self.data_manager, 'summary_count')) else "")
             
@@ -1267,9 +1441,10 @@ class ReportManager:
             
             # Adobe Acrobat limit is 200 inches (14,400 pts)
             # We'll use multiple pages if we exceed a safe limit per page (150 inches)
-            max_page_height = 144 * inch 
-            row_height = 13 # Compact 1-line row height
-            base_overhead = 175 # For header, footers and dividers
+            max_page_height = 150 * inch 
+            row_height = 13
+            # Overhead: Header(104) + Footer(35) + Safety(10)
+            base_overhead = 149
 
             # Group by category
             def sort_key(x):
@@ -1658,6 +1833,98 @@ class ReportManager:
             print(f"Catchup Report Error: {e}")
             return False
 
+    def generate_product_rename_report(self, filepath: str, date_str: str, 
+                                       old_name: str, new_name: str, 
+                                       old_cat: str, new_cat: str, 
+                                       in_qty: int, out_qty: int, user: str) -> bool:
+        try:
+            canvas = self.mod.canvas
+            inch = self.mod.inch
+            width = 2.24 * inch
+            margin = 0.1 * inch
+            
+            # 57mm Thermal format - Dynamic height
+            height = 225
+            c = canvas.Canvas(filepath, pagesize=(width, height))
+            y = height - (0.2 * inch)
+            
+            c.setFont("Helvetica-Bold", 10)
+            c.drawCentredString(width / 2.0, y, str(self.business_name))
+            y -= 12
+            c.setFont("Helvetica", 8)
+            c.drawCentredString(width / 2.0, y, APP_TITLE)
+            y -= 18
+            
+            c.setFont("Helvetica-Bold", 9)
+            c.drawCentredString(width / 2.0, y, "PRODUCT RENAME RECEIPT")
+            y -= 15
+            
+            c.setFont("Helvetica", 7)
+            c.drawString(margin, y, f"Date: {date_str}")
+            y -= 10
+            c.drawString(margin, y, f"User: {user}")
+            y -= 15
+            
+            c.setDash(2, 2)
+            c.line(margin, y, width - margin, y)
+            c.setDash(1, 0)
+            y -= 12
+            
+            c.setFont("Helvetica-Bold", 7)
+            c.drawString(margin, y, "RENAME DETAILS")
+            y -= 10
+            c.setFont("Helvetica", 7)
+            
+            # Old vs New Name
+            c.setFont("Helvetica-Bold", 7)
+            c.drawString(margin + 5, y, "FROM:")
+            c.setFont("Helvetica", 7)
+            c.drawString(margin + 40, y, f"{old_name}")
+            y -= 10
+            c.setFont("Helvetica-Bold", 7)
+            c.drawString(margin + 5, y, "TO:")
+            c.setFont("Helvetica", 7)
+            c.drawString(margin + 40, y, f"{new_name}")
+            y -= 15
+            
+            # Old vs New Category
+            c.setFont("Helvetica-Bold", 7)
+            c.drawString(margin + 5, y, "OLD CAT:")
+            c.setFont("Helvetica", 7)
+            c.drawString(margin + 40, y, f"{old_cat}")
+            y -= 10
+            c.setFont("Helvetica-Bold", 7)
+            c.drawString(margin + 5, y, "NEW CAT:")
+            c.setFont("Helvetica", 7)
+            c.drawString(margin + 40, y, f"{new_cat}")
+            y -= 15
+            
+            c.setDash(2, 2)
+            c.line(margin, y, width - margin, y)
+            c.setDash(1, 0)
+            y -= 12
+            
+            c.setFont("Helvetica-Bold", 7)
+            c.drawString(margin, y, "AFFECTED QTYS (AS OF EDIT)")
+            y -= 10
+            c.setFont("Helvetica", 7)
+            
+            c.drawString(margin + 5, y, f"Total In: {int(in_qty)}")
+            y -= 10
+            c.drawString(margin + 5, y, f"Total Out: {int(out_qty)}")
+            y -= 10
+            c.drawString(margin + 5, y, f"Stock Carryover: {int(in_qty - out_qty)}")
+            y -= 25
+            
+            c.setFont("Helvetica-Oblique", 6)
+            c.drawCentredString(width / 2.0, y, "*** END OF CORRECTION ***")
+            
+            c.save()
+            return True
+        except Exception as e:
+            print(f"Rename Report Error: {e}")
+            return False
+
 # --- EMAIL MANAGER ---
 class EmailManager:
     """
@@ -1900,6 +2167,7 @@ class POSSystem:
         self.correction_cart: List[Dict] = []
         self.remote_requests: List[Dict] = []
         self.lws_sidebars: Dict[str, ttk.Frame] = {}
+        self.current_master_renames: List[str] = []
 
         # Web Server State
         self.web_queue = queue.Queue()
@@ -1917,6 +2185,7 @@ class POSSystem:
         self.ensure_recipient_email()
         self.show_startup_report()
         self.check_restored_status()
+        self.check_edit_notifications()
 
         # Tasks
         self.root.after(1000, self.check_beginning_inventory_reminder)
@@ -2310,6 +2579,25 @@ class POSSystem:
                                     "have been successfully generated following the data restoration.")
             except Exception as e:
                 messagebox.showerror("Error", f"Post-restore report generation failed: {e}")
+
+    def check_edit_notifications(self):
+        """Checks for any pending product edit notifications stored in config."""
+        notifications = self.data_manager.config.get("edit_notifications", [])
+        if notifications:
+            for note in notifications:
+                msg = (f"PRODUCT CHANGE NOTIFICATION\n"
+                       f"---------------------------\n"
+                       f"A product has been updated in the system:\n\n"
+                       f"Name: {note['old_name']} -> {note['new_name']}\n"
+                       f"Category: {note['old_cat']} -> {note['new_cat']}\n"
+                       f"Affected In: {int(note['in_qty'])}\n"
+                       f"Affected Out: {int(note['out_qty'])}\n\n"
+                       f"All historical records have been updated.")
+                messagebox.showinfo("Product Change Notification", msg)
+            
+            # Clear notifications after showing
+            self.data_manager.config["edit_notifications"] = []
+            self.data_manager.save_config()
 
     # --- INVENTORY TAB ---
     def setup_inventory_tab(self):
@@ -3373,15 +3661,20 @@ class POSSystem:
         return None
 
     def get_sum_data(self, override_period=None):
-        global_stats, _, _, _ = self.data_manager.calculate_stats(None)
-
         # Use filtered period if override_period provided, otherwise get from UI selection
         if override_period:
             period = override_period
         else:
             period = self.get_period_dates()
 
-        period_stats, in_c, out_c, corr_list = self.data_manager.calculate_stats(period)
+        # Calculate historical stock balance if a period is selected (shows stock AS OF the end of that period)
+        if period:
+            _, end_dt = period
+            global_stats, _, _, _, _ = self.data_manager.calculate_stats((datetime.datetime(2000, 1, 1), end_dt))
+        else:
+            global_stats, _, _, _, _ = self.data_manager.calculate_stats(None)
+
+        period_stats, in_c, out_c, corr_list, master_renames = self.data_manager.calculate_stats(period)
 
         rows = []
         all_names = set(self.data_manager.products_df['Product Name'].astype(str)) | set(global_stats.keys())
@@ -3460,10 +3753,10 @@ class POSSystem:
             is_active = (r['in'] > 0 or r['out'] > 0 or r['remaining'] > 0 or r['base_name'] in names_in_excel)
             if is_active: final_rows.append(r)
 
-        return final_rows, in_c, out_c, corr_list
+        return final_rows, in_c, out_c, corr_list, master_renames
 
     def gen_view(self, override_period=None):
-        data, in_c, out_c, corr_list = self.get_sum_data(override_period)
+        data, in_c, out_c, corr_list, m_renames = self.get_sum_data(override_period)
         for i in self.sum_tree.get_children(): self.sum_tree.delete(i)
 
         p_txt = self.report_type.get()
@@ -3686,12 +3979,13 @@ class POSSystem:
             
         self.current_aggregated = data
         self.current_per_trans = per_trans
+        self.current_master_renames = m_renames
             
-        return data, tot, p_txt, in_c, out_c, corr_list, is_daily, total_cash, total_change, per_trans
+        return data, tot, p_txt, in_c, out_c, corr_list, is_daily, total_cash, total_change, per_trans, m_renames
 
     def gen_pdf(self):
         is_custom_date = self.chk_custom_date_var.get()
-        data, tot, p_txt, in_c, out_c, corr_list, is_daily, total_cash, total_change, per_trans = self.gen_view()
+        data, tot, p_txt, in_c, out_c, corr_list, is_daily, total_cash, total_change, per_trans, m_renames = self.gen_view()
         now = get_current_time()
 
         prefix = "History" if is_custom_date else "Summary"
@@ -3704,7 +3998,8 @@ class POSSystem:
         success = self.report_manager.generate_thermal_summary_receipt(
             full_path, title, now.strftime('%Y-%m-%d %H:%M:%S'), p_txt,
             self.current_aggregated, self.current_per_trans, is_per_trans,
-            tot, total_cash, total_change, in_c, out_c, corr_list
+            tot, total_cash, total_change, in_c, out_c, corr_list,
+            master_renames=m_renames
         )
 
         if success:
@@ -3722,7 +4017,7 @@ class POSSystem:
         end_of_day = today.replace(hour=23, minute=59, second=59, microsecond=999999)
         period = (start_of_day, end_of_day)
         
-        data, in_c, out_c, corr_list = self.get_sum_data(override_period=period)
+        data, in_c, out_c, corr_list, m_renames = self.get_sum_data(override_period=period)
         
         tot = 0
         total_cash = 0.0
@@ -3829,17 +4124,13 @@ class POSSystem:
             return (cat, x['name'])
         data.sort(key=sort_key)
 
-        is_per_trans = True
-        try:
-            if hasattr(self, 'chk_items_per_trans_var'):
-                is_per_trans = self.chk_items_per_trans_var.get()
-        except:
-            pass
+        is_per_trans = False
             
         success = self.report_manager.generate_thermal_summary_receipt(
             full_path, "DAILY SUMMARY", today.strftime('%Y-%m-%d %H:%M:%S'), today.strftime("%a, %d %b %y"),
             data, per_trans, is_per_trans,
-            tot, total_cash, total_change, in_c, out_c, corr_list
+            tot, total_cash, total_change, in_c, out_c, corr_list,
+            master_renames=m_renames
         )
         if success:
             print(f"Auto Daily Summary generated: {fname}")
@@ -4632,11 +4923,12 @@ class POSSystem:
                         "Restore the products database from the latest automatic backup. Use if the current file is corrupted.",
                         "Restore Backup", self.regenerate_products_file,
                         warning="CAUTION: This will overwrite your current 'products.xlsx' with the latest backup. Any unsaved changes since the last backup will be lost.")
-        
-        add_setting_row(m_f, "Smart Cleanup (AI)", 
-                        "Uses intelligent logic (and AI if enabled) to clean and standardize product names.",
-                        "Start Smart Cleanup", self.smart_cleanup,
-                        warning="This will modify product names in both the Excel file and the transaction database.")
+
+        # --- PRODUCT EDITOR ---
+
+        add_setting_row(m_f, "Product Editor", 
+                        "Rename products and update categories while preserving all historical data and stock carryover.",
+                        "Open Editor", self.open_product_editor)
 
         po_f = ttk.LabelFrame(f, text="Phased Out Products")
         po_f.pack(fill="x", padx=10, pady=5)
@@ -4745,6 +5037,17 @@ class POSSystem:
             self.data_manager.config["startup"] = False
             self.data_manager.save_config()
             messagebox.showinfo("Startup", "Disabled.")
+
+    def open_product_editor(self):
+        """Opens the external product editor module."""
+        try:
+            from product_editor import ProductEditor
+            editor = ProductEditor(self)
+            editor.show_editor_window()
+        except ImportError as e:
+            messagebox.showerror("Error", f"Product Editor module (product_editor.py) failed to load: {e}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not open Product Editor: {e}")
 
     def manage_phased_out_products(self):
         phased_out = []
@@ -5202,279 +5505,6 @@ class POSSystem:
             
         except Exception as e:
             messagebox.showerror("Error", f"Failed to delete all data: {e}")
-
-    def smart_cleanup(self):
-        # 1. Rules Engine
-        def generate_smart_name(old_name: str) -> str:
-            name = old_name.upper()
-            
-            # Typos
-            name = name.replace("REALXING", "RELAXING")
-            
-            # Abbreviations
-            name = re.sub(r'\bSYR\b', 'SYRUP', name)
-            name = re.sub(r'\bTAB\b', 'TABLET', name)
-            name = re.sub(r'\bCAP\b', 'CAPSULE', name)
-            name = re.sub(r'\bSUSP\b', 'SUSPENSION', name)
-            name = re.sub(r'\bCR\b', 'CREAM', name)
-            name = re.sub(r'\bCRM\b', 'CREAM', name)
-            name = re.sub(r'\bEXT\b', 'EXTRA', name)
-            name = re.sub(r'\bOINT\b', 'OINTMENT', name)
-            name = re.sub(r'\bLIQ\b', 'LIQUID', name)
-            name = re.sub(r'\bDRP\b', 'DROPS', name)
-            
-            # Unit standardizations
-            name = re.sub(r'(\d+)\s*GMS\b', r'\1G', name)
-            name = re.sub(r'(\d+)\s*GM\b', r'\1G', name)
-            name = re.sub(r'\bLITER\b', '1L', name)
-            
-            # Pack sizes
-            name = re.sub(r'\b(\d+)S\b', r"\1'S", name)
-            name = re.sub(r'\bX(\d+)\b', r" \1'S", name) 
-            name = re.sub(r'\bX\s*(\d+)S\b', r"\1'S", name)
-            name = re.sub(r'\bX\s*(\d+)\b', r"\1'S", name)
-            
-            # Remove noise
-            noise_words = [r'20%\s*OFF', r'\(9\+1\)', r'PROMO\s*PACK', r'VALUEPACK', r'PROMOPACK', r'BIG', r'SML', r'SMALL', r'MED']
-            for noise in noise_words:
-                name = re.sub(noise, '', name)
-                
-            # Clean multiple spaces again
-            name = re.sub(r'\s+', ' ', name).strip()
-            # Remove trailing dash/space
-            name = re.sub(r'[- ]+$', '', name)
-            return name
-
-        try:
-            raw_df = self.mod.pd.read_excel(DATA_FILE)
-            if 'Product Name' not in raw_df.columns:
-                return
-        except Exception:
-            return
-
-        names = raw_df['Product Name'].dropna().unique().tolist()
-        
-        # --- GEMINI INTEGRATION ---
-        use_gemini = False
-        proposals = []
-        if GEMINI_API_KEY:
-            try:
-                import google.generativeai as genai
-                # Check online status implicitly by trying to configure and call
-                genai.configure(api_key=GEMINI_API_KEY)
-                # Ensure the key is valid by fetching models
-                list(genai.list_models())
-                use_gemini = True
-            except Exception as e:
-                print(f"Gemini initialization failed, falling back to regex: {e}")
-                use_gemini = False
-
-        if use_gemini:
-            # Show a processing dialog since Gemini might take a moment
-            proc_win = tk.Toplevel(self.root)
-            proc_win.title("Processing")
-            proc_win.geometry("300x100")
-            proc_win.grab_set()
-            ttk.Label(proc_win, text="Processing names with Gemini AI...\nPlease wait.", justify="center").pack(expand=True)
-            self.root.update()
-
-            try:
-                import google.generativeai as genai
-                model = genai.GenerativeModel("gemini-1.5-flash")
-                
-                # Batch processing to avoid hitting limits or huge prompts
-                batch_size = 50
-                for i in range(0, len(names), batch_size):
-                    batch_names = names[i:i + batch_size]
-                    
-                    prompt = f"""
-                    You are an expert pharmacist and inventory manager. I will provide you with a JSON array of messy product names from a pharmacy and convenience store point of sale system. 
-                    Your task is to standardize these names to make them easily searchable and clean.
-                    
-                    Rules:
-                    1. Expand confusing abbreviations (e.g. SYR -> SYRUP, TAB -> TABLET, OINT -> OINTMENT, CAP -> CAPSULE).
-                    2. Maintain clear brand names (e.g. 'JB' should likely be 'JOHNSONS BABY' or remain if unsure).
-                    3. Normalize units and pack sizes (e.g. '15GM' -> '15G', 'X24S' -> \"24'S\", 'LITER' -> '1L').
-                    4. Remove promotional text like '20% OFF', 'PROMO PACK', 'VALUEPACK', '(9+1)'.
-                    5. Order logically, e.g. [Brand] [Product] [Variant] [Size].
-                    6. DO NOT combine variants (e.g. keep Orange and Strawberry separate).
-                    7. Do not change the name drastically if you are unsure.
-                    
-                    Input Names:
-                    {json.dumps(batch_names)}
-                    
-                    Return ONLY a valid JSON object mapping the exact ORIGINAL name string to the NEW standardized name string. No markdown formatting, just raw JSON.
-                    """
-                    
-                    response = model.generate_content(prompt)
-                    try:
-                        # Clean up response to ensure it's valid JSON (sometimes it wraps in ```json ... ```)
-                        resp_text = response.text.replace("```json", "").replace("```", "").strip()
-                        ai_mapping = json.loads(resp_text)
-                        
-                        for old, new in ai_mapping.items():
-                            if old in batch_names and str(old) != str(new):
-                                proposals.append((str(old), str(new)))
-                    except Exception as e:
-                        print(f"Failed to parse Gemini batch {i}: {e}")
-                        print(f"Raw output: {response.text}")
-                        # Fallback for this batch if it fails
-                        for old in batch_names:
-                            old_str = str(old)
-                            new_str = generate_smart_name(old_str)
-                            if old_str != new_str:
-                                proposals.append((old_str, new_str))
-            except Exception as e:
-                print(f"Gemini API failure during processing: {e}")
-                messagebox.showerror("AI Error", "Failed to connect to Gemini AI. Falling back to offline rule engine.", parent=proc_win)
-                # Fallback to local regex for remaining
-                for old in names:
-                    if not any(old == p[0] for p in proposals): # Don't redo ones already caught
-                        old_str = str(old)
-                        new_str = generate_smart_name(old_str)
-                        if old_str != new_str:
-                            proposals.append((old_str, new_str))
-            finally:
-                proc_win.destroy()
-        else:
-            # Offline / Regex Mode
-            for old in names:
-                old_str = str(old)
-                new_str = generate_smart_name(old_str)
-                if old_str != new_str:
-                    proposals.append((old_str, new_str))
-                
-        if not proposals:
-            messagebox.showinfo("Smart Cleanup", "No product names require renaming.")
-            return
-
-        # 2. Review Screen UI
-        win = tk.Toplevel(self.root)
-        win.title("Smart Rename Products")
-        win.geometry("800x600")
-        win.grab_set()
-
-        ttk.Label(win, text="Review suggested product name changes. Selected items will have their stock and history merged.", font=("Segoe UI", 10)).pack(pady=10)
-
-        columns = ("Status", "Old Name", "New Name")
-        tree = ttk.Treeview(win, columns=columns, show="headings", height=20)
-        tree.heading("Status", text="Status")
-        tree.heading("Old Name", text="Current Name")
-        tree.heading("New Name", text="Proposed Name")
-        tree.column("Status", width=50, anchor="center")
-        tree.column("Old Name", width=350)
-        tree.column("New Name", width=350)
-        tree.pack(fill="both", expand=True, padx=10, pady=5)
-
-        # Style treeview rows
-        tree.tag_configure("checked", background="#d4edda")
-        tree.tag_configure("unchecked", background="#f8d7da")
-
-        for old, new in proposals:
-            tree.insert("", "end", values=("[✓]", old, new), tags=("checked",))
-            
-        def toggle_row(event):
-            item_id = tree.identify_row(event.y)
-            if item_id:
-                vals = list(tree.item(item_id, "values"))
-                if vals[0] == "[✓]":
-                    vals[0] = "[ ]"
-                    tree.item(item_id, values=vals, tags=("unchecked",))
-                else:
-                    vals[0] = "[✓]"
-                    tree.item(item_id, values=vals, tags=("checked",))
-
-        tree.bind("<Double-1>", toggle_row)
-
-        btn_frame = ttk.Frame(win)
-        btn_frame.pack(pady=10)
-
-        def select_all():
-            for item_id in tree.get_children():
-                vals = list(tree.item(item_id, "values"))
-                vals[0] = "[✓]"
-                tree.item(item_id, values=vals, tags=("checked",))
-
-        def deselect_all():
-            for item_id in tree.get_children():
-                vals = list(tree.item(item_id, "values"))
-                vals[0] = "[ ]"
-                tree.item(item_id, values=vals, tags=("unchecked",))
-
-        def apply_changes():
-            to_rename = {}
-            for item_id in tree.get_children():
-                vals = tree.item(item_id, "values")
-                if vals[0] == "[✓]":
-                    to_rename[vals[1]] = vals[2]
-
-            if not to_rename:
-                messagebox.showinfo("No Selection", "No items selected to rename.", parent=win)
-                return
-
-            confirm = simpledialog.askstring("Confirm", "Type 'CONFIRM' to finalize smart rename changes:", parent=win)
-            if confirm != "CONFIRM":
-                messagebox.showinfo("Cancelled", "Smart rename cancelled.", parent=win)
-                return
-
-            try:
-                # 3. Update products.xlsx
-                df = self.mod.pd.read_excel(DATA_FILE)
-                if 'Product Name' in df.columns:
-                    df['Product Name'] = df['Product Name'].apply(lambda x: to_rename.get(str(x), str(x)))
-                
-                # Deduplicate by saving - wait, load_products will deduplicate automatically. We just rewrite the Excel.
-                # Filter out internal columns
-                clean_df = df[[c for c in df.columns if not str(c).startswith('_')]]
-                clean_df.to_excel(DATA_FILE, index=False)
-
-                # 4. Update ledger history mapping
-                with self.data_manager._ledger_lock:
-                    for tx in self.data_manager.ledger:
-                        for item in tx.get('items', []):
-                            op_name = item.get('name')
-                            if op_name in to_rename:
-                                item['name'] = to_rename[op_name]
-                    
-                    for hist in self.data_manager.product_history:
-                        for p in hist.get('items', []):
-                            ph_name = p.get('Product Name')
-                            if ph_name in to_rename:
-                                p['Product Name'] = to_rename[ph_name]
-                                
-                    # Write out ledger
-                    temp_file = LEDGER_FILE + ".tmp"
-                    data = {
-                        "transactions": self.data_manager.ledger,
-                        "summary_count": self.data_manager.summary_count,
-                        "shortcuts_asked": self.data_manager.shortcuts_asked,
-                        "product_history": self.data_manager.product_history
-                    }
-                    with open(temp_file, 'w') as f:
-                        json.dump(data, f, indent=2)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    os.replace(temp_file, LEDGER_FILE)
-
-                # 5. Reload Everything
-                self.data_manager.load_products()
-                self.data_manager.refresh_stock_cache()
-
-                self.refresh_inv()
-                self.refresh_pos()
-                self.refresh_correction_list()
-
-                messagebox.showinfo("Success", f"Renamed {len(to_rename)} products successfully.", parent=win)
-                win.destroy()
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to rename products: {e}", parent=win)
-
-        ttk.Button(btn_frame, text="Select All", command=select_all).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="Deselect All", command=deselect_all).pack(side="left", padx=5)
-        ttk.Button(btn_frame, text="Approve & Rename", command=apply_changes, style="Accent.TButton").pack(side="left", padx=5)
-
-
-
 
     def export_stock_xlsx(self):
         # Category, Product Name, Stock
