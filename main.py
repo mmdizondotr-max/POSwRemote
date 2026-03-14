@@ -41,7 +41,7 @@ SALESREPORT_FOLDER = "salesreport"
 DATA_FILE = "products.xlsx"
 CONFIG_FILE = os.path.join(APP_DATA_DIR, "config.json")
 LEDGER_FILE = os.path.join(APP_DATA_DIR, "ledger.json")
-APP_TITLE = "MMD Inventory Tracker v16.12"  # Refactored Version
+APP_TITLE = "MMD Inventory Tracker v16.14"  # Refactored Version
 
 # --- EMAIL CONFIGURATION ---
 SMTP_SERVER = "smtp.gmail.com"
@@ -642,6 +642,12 @@ class DataManager:
                     in_count += 1
                 elif t_type == 'sales':
                     out_count += 1
+                elif t_type == 'returns':
+                    # Returns add back to inventory, so we count them as an "in" event for activity
+                    in_count += 1 
+                elif t_type == 'damaged':
+                    # Damaged items leave inventory, so we count them as an "out" event for activity
+                    out_count += 1
 
                 ref_type = transaction.get('ref_type')
 
@@ -659,7 +665,13 @@ class DataManager:
                     base_name = item.get('base_product', name)
                     
                     if base_name not in stats:
-                        stats[base_name] = {'name': base_name, 'in': 0, 'out': 0, 'sales_lines': [], 'in_lines': [], 'latest_cat': item_cat}
+                        stats[base_name] = {
+                            'name': base_name, 'in': 0, 'out': 0, 
+                            'returns': 0, 'damaged': 0, 'returns_amt': 0.0,
+                            'sales_lines': [], 'in_lines': [], 
+                            'return_lines': [], 'damaged_lines': [], 
+                            'latest_cat': item_cat
+                        }
                     else:
                         stats[base_name]['latest_cat'] = item_cat
 
@@ -672,6 +684,18 @@ class DataManager:
                     elif t_type == 'inventory':
                         stats[base_name]['in'] += qty
                         stats[base_name]['in_lines'].append({'price': price, 'qty': qty, 'category': item_cat})
+                    elif t_type == 'returns':
+                        # Returns add back to inventory
+                        stats[base_name]['in'] += qty
+                        stats[base_name]['returns'] += qty
+                        amt = float(item.get('subtotal', price * qty))
+                        stats[base_name]['returns_amt'] += amt
+                        stats[base_name]['return_lines'].append({'name': name, 'price': price, 'qty': qty, 'amt': amt, 'category': item_cat})
+                    elif t_type == 'damaged':
+                        # Damaged removes from inventory
+                        stats[base_name]['out'] += qty
+                        stats[base_name]['damaged'] += qty
+                        stats[base_name]['damaged_lines'].append({'name': name, 'price': price, 'qty': qty, 'category': item_cat})
                     elif t_type == 'correction':
                         if ref_type == 'sales':
                             stats[base_name]['out'] += qty
@@ -680,6 +704,16 @@ class DataManager:
                         elif ref_type == 'inventory':
                             stats[base_name]['in'] += qty
                             stats[base_name]['in_lines'].append({'price': price, 'qty': qty, 'category': item_cat})
+                        elif ref_type == 'returns':
+                            stats[base_name]['in'] += qty
+                            stats[base_name]['returns'] += qty
+                            amt = qty * price
+                            stats[base_name]['returns_amt'] += amt
+                            stats[base_name]['return_lines'].append({'name': name, 'price': price, 'qty': qty, 'amt': amt, 'category': item_cat})
+                        elif ref_type == 'damaged':
+                            stats[base_name]['out'] += qty
+                            stats[base_name]['damaged'] += qty
+                            stats[base_name]['damaged_lines'].append({'name': name, 'price': price, 'qty': qty, 'category': item_cat})
 
             except Exception:
                 continue
@@ -1006,10 +1040,7 @@ class ReportManager:
             # --- Wrapping logic to calculate height and display correctly ---
             max_chars = 32 # Capacity for 8pt Courier on 57mm
             
-            total_discount_sum = 0.0
-            for pt in (per_trans_data or []):
-                if pt.get('type') == 'sales':
-                    total_discount_sum += float(pt.get('total_discount', 0.0))
+            total_discount_sum = sum(float(pt.get('total_discount', 0.0)) for pt in (per_trans_data or []) if pt.get('type') == 'sales')
 
             def wrap_txt(txt, limit):
                 s = str(txt)
@@ -1068,14 +1099,21 @@ class ReportManager:
                     calc_h += 22 # Name(10) + Details(12)
             
             # 2. Main Footer
-            # Divider(12) + Total Sales(12) = 24
+            # Divider(12) + Net Sales(12) = 24
             calc_h += 24
+            
+            # Additional footer labels
+            tot_returns_amt = sum(float(i.get('returns_amt', 0)) for i in (aggregated_data or []))
+            tot_damaged_qty = sum(int(i.get('damaged', 0)) for i in (aggregated_data or []))
+            
+            if tot_returns_amt > 0:
+                calc_h += 22 # Gross(10) + Returns(10) + Dash(2)
+            
+            if tot_damaged_qty > 0:
+                calc_h += 10 # Damaged line
+            
             if total_cash > 0 or total_change != 0:
-                calc_h += 20 # Cash(10) + Change(10)
-                if total_discount_sum > 0: 
-                    calc_h += 15 # Discount line
-                else: 
-                    calc_h += 5 # Else gap
+                calc_h += 35 # Cash(10) + Change(10) + Discount(15)
             
             # Total Qty (In/Out) line
             calc_h += 15
@@ -1188,7 +1226,51 @@ class ReportManager:
                         
                         y -= 5 # space between trans
                             
-                    elif pt.get('type') == 'inventory':
+                    elif pt.get('type') == 'returns':
+                        header_text = f"{pt['time']} RETURN - {pt['filename']}"
+                        if len(header_text) > 30: header_text = header_text[:27] + "..."
+                        
+                        c.setFont("Helvetica-Bold", 7)
+                        c.drawString(margin, y, header_text)
+                        c.drawRightString(width - margin, y, f"-{pt['subtotal']:.2f}")
+                        y -= 10
+                        
+                        c.setFont("Helvetica", 7)
+                        for item in pt.get('items', []):
+                            name = str(item.get('name', 'Unknown'))
+                            if len(name) > 20: name = name[:10] + "..." + name[-7:]
+                            
+                            qty = item.get('qty', 0)
+                            price = item.get('price', 0.0)
+                            subtotal = item.get('subtotal', 0.0)
+                            
+                            c.drawString(margin + 5, y, name)
+                            y -= 10
+                            c.drawString(margin + 5, y, f"  {int(qty)} x {price:.2f}")
+                            c.drawRightString(width - margin, y, f"-{subtotal:.2f}")
+                            y -= 12
+                        
+                        y -= 5 # space between trans
+
+                    elif pt.get('type') == 'damaged':
+                        header_text = f"{pt['time']} DAMAGED - {pt['filename']}"
+                        if len(header_text) > 30: header_text = header_text[:27] + "..."
+                        
+                        c.setFont("Helvetica-Bold", 7)
+                        c.drawString(margin, y, header_text)
+                        c.drawRightString(width - margin, y, f"Qty:{pt['total_qty']}")
+                        y -= 10
+                        
+                        c.setFont("Helvetica", 7)
+                        for item in pt.get('items', []):
+                            name = str(item.get('name', 'Unknown'))
+                            if len(name) > 20: name = name[:10] + "..." + name[-7:]
+                            qty = item.get('qty', 0)
+                            c.drawString(margin + 5, y, name)
+                            c.drawRightString(width - margin, y, str(int(qty)))
+                            y -= 12
+                        
+                        y -= 5 # space between trans
                         header_text = f"{pt['time']} INVENTORY - {pt['filename']}"
                         if len(header_text) > 30: header_text = header_text[:27] + "..."
                         
@@ -1243,12 +1325,22 @@ class ReportManager:
                     in_v = item.get('in', 0)
                     out_v = item.get('out', 0)
                     stk_v = item.get('remaining', 0) if not is_var else "-"
+                    ret_v = item.get('returns', 0)
+                    dam_v = item.get('damaged', 0)
                     sales = item.get('sales', 0.0)
                     total_qty += int(out_v)
                     
+                    extra = ""
+                    if ret_v > 0: extra += f" Ret:{int(ret_v)}"
+                    if dam_v > 0: extra += f" Dam:{int(dam_v)}"
+                    
                     c.drawString(indent, y, name)
                     y -= 10
-                    c.drawString(indent, y, f"  In:{in_v} Out:{out_v} Stk:{stk_v}")
+                    # Pure In/Out for display: Stock activity minus corrections
+                    pure_in = in_v - ret_v
+                    pure_out = out_v - dam_v
+                    
+                    c.drawString(indent, y, f"  In:{int(pure_in)} Out:{int(pure_out)} Stk:{stk_v}{extra}")
                     c.drawRightString(width - margin, y, f"{sales:.2f}")
                     y -= 12
                     
@@ -1257,12 +1349,35 @@ class ReportManager:
             c.setDash(1, 0)
             y -= 12
             
+            # Calculate extra footer totals
+            tot_returns_amt = sum(float(i.get('returns_amt', 0)) for i in (aggregated_data or []))
+            tot_damaged_qty = sum(int(i.get('damaged', 0)) for i in (aggregated_data or []))
+            gross_sales = tot_sales + tot_returns_amt
+
+            c.setFont("Helvetica", 7)
+            if tot_returns_amt > 0:
+                c.drawString(margin, y, "TOTAL SALES (GROSS):")
+                c.drawRightString(width - margin, y, f"{gross_sales:.2f}")
+                y -= 12
+                c.drawString(margin, y, "TOTAL RETURNS:")
+                c.drawRightString(width - margin, y, f"-{tot_returns_amt:.2f}")
+                y -= 14
+                c.setDash(2, 2)
+                # Separator line between returns and net sales (positioned above Net Sales)
+                c.line(margin, y + 10, width - margin, y + 10)
+                c.setDash(1, 0)
+            
             c.setFont("Helvetica-Bold", 8)
-            c.drawString(margin, y, "TOTAL SALES:")
+            c.drawString(margin, y, "NET SALES (DAY):")
             c.drawRightString(width - margin, y, f"{tot_sales:.2f}")
-            y -= 12
+            y -= 14
             
             c.setFont("Helvetica", 7)
+            if tot_damaged_qty > 0:
+                c.drawString(margin, y, "TOTAL DAMAGED ITEMS:")
+                c.drawRightString(width - margin, y, str(int(tot_damaged_qty)))
+                y -= 10
+
             if total_cash > 0 or total_change != 0:
                 c.drawString(margin, y, "TOTAL CASH TND:")
                 c.drawRightString(width - margin, y, f"{total_cash:.2f}")
@@ -1281,6 +1396,7 @@ class ReportManager:
                 else:
                     y -= 5
             
+            c.setFont("Helvetica", 6)
             c.drawString(margin, y, f"In: {in_c} | Out: {out_c}")
             y -= 15
             
@@ -2026,7 +2142,7 @@ class EmailManager:
 
     def trigger_summary_email(self, recipient: str, summary_pdf_path: str, ledger_path: str,
                               business_name: str, count: int, user: str, extra_body: str = "",
-                              extra_attachments: List[str] = None, on_success: Any = None) -> None:
+                              extra_attachments: List[str] = None, on_success: Any = None, on_error: Any = None) -> None:
         # Remove if not recipient: return to allow defaulting in send_email_thread
 
         date_str = get_current_time().strftime("%Y-%m-%d")
@@ -2050,7 +2166,7 @@ class EmailManager:
         if extra_attachments:
             attachments.extend(extra_attachments)
 
-        self.send_email_thread(recipient, subject, body, attachments, on_success=on_success)
+        self.send_email_thread(recipient, subject, body, attachments, on_success=on_success, on_error=on_error)
 
 # --- WEB SERVER THREAD ---
 class WebServerThread(threading.Thread):
@@ -2164,6 +2280,8 @@ class POSSystem:
         # Carts & UI State
         self.sales_cart: List[Dict] = []
         self.inventory_cart: List[Dict] = []
+        self.returns_cart: List[Dict] = []
+        self.damaged_cart: List[Dict] = []
         self.correction_cart: List[Dict] = []
         self.remote_requests: List[Dict] = []
         self.lws_sidebars: Dict[str, ttk.Frame] = {}
@@ -2200,6 +2318,8 @@ class POSSystem:
 
         self.tab_inventory = ttk.Frame(self.notebook)
         self.tab_pos = ttk.Frame(self.notebook)
+        self.tab_returns = ttk.Frame(self.notebook)
+        self.tab_damaged = ttk.Frame(self.notebook)
         self.tab_correction = ttk.Frame(self.notebook)
         self.tab_receipts = ttk.Frame(self.notebook)
         self.tab_summary = ttk.Frame(self.notebook)
@@ -2208,6 +2328,8 @@ class POSSystem:
 
         self.notebook.add(self.tab_inventory, text="Inventory")
         self.notebook.add(self.tab_pos, text="POS Sales")
+        self.notebook.add(self.tab_returns, text="Returns")
+        self.notebook.add(self.tab_damaged, text="Damaged")
         self.notebook.add(self.tab_correction, text="Correction")
         self.notebook.add(self.tab_receipts, text="Receipts")
         self.notebook.add(self.tab_summary, text="Summary")
@@ -2216,6 +2338,8 @@ class POSSystem:
 
         self.setup_inventory_tab()
         self.setup_pos_tab()
+        self.setup_returns_tab()
+        self.setup_damaged_tab()
         self.setup_correction_tab()
         self.setup_receipts_tab()
         self.setup_summary_tab()
@@ -2240,6 +2364,15 @@ class POSSystem:
                     if not messagebox.askyesno("Uncommitted Items", "You have uncommitted items in POS (SALES).\nAre you sure you want to leave this tab?", icon='warning'):
                         self.notebook.select(self._current_tab_index)
                         return
+                elif self._current_tab_index == self.notebook.index(self.tab_returns) and getattr(self, 'returns_cart', []):
+                    if not messagebox.askyesno("Uncommitted Items", "You have uncommitted items in RETURNS.\nAre you sure you want to leave this tab?", icon='warning'):
+                        self.notebook.select(self._current_tab_index)
+                        return
+                elif self._current_tab_index == self.notebook.index(self.tab_damaged) and getattr(self, 'damaged_cart', []):
+                    if not messagebox.askyesno("Uncommitted Items", "You have uncommitted items in DAMAGED.\nAre you sure you want to leave this tab?", icon='warning'):
+                        self.notebook.select(self._current_tab_index)
+                        return
+
 
         self._current_tab_index = new_tab_index
 
@@ -2250,23 +2383,35 @@ class POSSystem:
         if hasattr(self, 'lbl_stock_avail'): self.lbl_stock_avail.config(text="")
         if hasattr(self, 'pos_dropdown'): self.pos_dropdown.set('')
 
-        current_tab = self.notebook.tab(self.notebook.select(), "text")
+        current_tab = self.notebook.tab(self.notebook.select(), "text").upper()
         if current_tab == 'CORRECTION':
             self.refresh_correction_list()
         elif current_tab == 'SUMMARY':
             if hasattr(self, 'report_type'):
                 self.report_type.set('Daily')
                 self.on_report_type_change()
+        elif current_tab == 'RETURNS':
+            self.refresh_returns()
+        elif current_tab == 'DAMAGED':
+            self.refresh_damaged()
+
 
     def on_closing(self):
         has_uncommitted = False
         warning_msg = ""
         if getattr(self, 'inventory_cart', []):
             has_uncommitted = True
-            warning_msg = "You have uncommitted items in INVENTORY.\n"
-        elif getattr(self, 'sales_cart', []):
+            warning_msg += "You have uncommitted items in INVENTORY.\n"
+        if getattr(self, 'sales_cart', []):
             has_uncommitted = True
-            warning_msg = "You have uncommitted items in POS (SALES).\n"
+            warning_msg += "You have uncommitted items in POS (SALES).\n"
+        if getattr(self, 'returns_cart', []):
+            has_uncommitted = True
+            warning_msg += "You have uncommitted items in RETURNS.\n"
+        if getattr(self, 'damaged_cart', []):
+            has_uncommitted = True
+            warning_msg += "You have uncommitted items in DAMAGED.\n"
+
 
         if has_uncommitted:
             if not messagebox.askyesno("Uncommitted Items", f"{warning_msg}Are you sure you want to exit?", icon='warning'):
@@ -3148,6 +3293,407 @@ class POSSystem:
             self.clear_pos()
             messagebox.showinfo("Success", f"Saved: {fname}")
 
+    # --- RETURNS TAB ---
+    def setup_returns_tab(self):
+        self.tab_returns.config(style="Sales.TFrame")
+        self.setup_lws_sidebar(self.tab_returns, "returns")
+
+        main_content = ttk.Frame(self.tab_returns, style="Sales.TFrame")
+        main_content.pack(side="left", fill="both", expand=True)
+
+        f = ttk.LabelFrame(main_content, text="Return Items")
+        f.pack(fill="x", padx=5, pady=5)
+
+        input_row = ttk.Frame(f)
+        input_row.pack(fill="x", padx=5, pady=5)
+
+        self.ret_prod_var = tk.StringVar()
+        self.ret_dropdown = ttk.Combobox(input_row, textvariable=self.ret_prod_var, width=45)
+        self.ret_dropdown['values'] = self.get_dropdown_values()
+        self.setup_searchable_combobox(self.ret_dropdown)
+        self.ret_dropdown.pack(side="left", padx=5)
+
+        ttk.Label(input_row, text="Qty:").pack(side="left")
+        self.ret_qty_var = tk.IntVar(value=1)
+        ttk.Entry(input_row, textvariable=self.ret_qty_var, width=5).pack(side="left", padx=2)
+        ttk.Button(input_row, text="ADD", command=self.add_return).pack(side="left", padx=10)
+
+        self.lbl_ret_sold_7d = ttk.Label(input_row, text="", foreground="blue", font=("Segoe UI", 9, "bold"))
+        self.lbl_ret_sold_7d.pack(side="left", padx=10)
+
+        self.ret_dropdown.bind("<<ComboboxSelected>>", self.on_ret_sel)
+
+        tree_frame = ttk.Frame(main_content)
+        tree_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        scrollbar = ttk.Scrollbar(tree_frame)
+        scrollbar.pack(side="right", fill="y")
+
+        self.ret_tree = ttk.Treeview(tree_frame, columns=("cat", "name", "price", "qty", "sub", "promo"),
+                                     show="headings", yscrollcommand=scrollbar.set)
+        scrollbar.config(command=self.ret_tree.yview)
+
+        self.ret_tree.heading("cat", text="Cat")
+        self.ret_tree.heading("name", text="Product")
+        self.ret_tree.heading("price", text="Price")
+        self.ret_tree.heading("qty", text="Qty")
+        self.ret_tree.heading("sub", text="Sub")
+        self.ret_tree.heading("promo", text="[EDIT]")
+        self.ret_tree.column("cat", width=60)
+        self.ret_tree.column("name", width=250)
+        self.ret_tree.column("price", width=60)
+        self.ret_tree.column("qty", width=40)
+        self.ret_tree.column("sub", width=70)
+        self.ret_tree.column("promo", width=35, anchor="center")
+        self.ret_tree.pack(fill="both", expand=True)
+        self.ret_tree.bind("<ButtonRelease-1>", self.on_ret_tree_click)
+        self.ret_tree.tag_configure('variant', foreground='#555555')
+
+        b = ttk.Frame(main_content)
+        b.pack(fill="x", padx=5, pady=10)
+        
+        self.lbl_ret_total = ttk.Label(b, text="Total Refund: 0.00", font=("Segoe UI", 14, "bold"), foreground="#d32f2f")
+        self.lbl_ret_total.pack(side="left", anchor="w")
+
+        ttk.Button(b, text="RETURN", command=self.commit_returns, style="Accent.TButton").pack(side="right", ipadx=20)
+        ttk.Button(b, text="Clear", command=self.clear_returns).pack(side="right", padx=5)
+        ttk.Button(b, text="Del", command=self.del_returns_line).pack(side="right", padx=5)
+
+    def on_ret_sel(self, e=None):
+        sel = self.ret_prod_var.get()
+        if not sel: self.lbl_ret_sold_7d.config(text=""); return
+
+        _, name, _, _ = self.data_manager.get_product_details_by_str(sel)
+        
+        # Calculate items sold in last 7 days
+        sold_7d = 0
+        now = get_current_time()
+        start_date = now - datetime.timedelta(days=7)
+        
+        for trans in self.data_manager.ledger:
+            if trans.get('type') == 'sales':
+                try:
+                    ts = datetime.datetime.strptime(trans.get('timestamp', ''), "%Y-%m-%d %H:%M:%S")
+                    if ts >= start_date:
+                        for item in trans.get('items', []):
+                            if item.get('name') == name or item.get('base_product') == name:
+                                sold_7d += item.get('qty', 0)
+                except:
+                    continue
+        
+        self.lbl_ret_sold_7d.config(text=f"Sold (7d): {int(sold_7d)}")
+
+    def add_return(self):
+        sel, qty = self.ret_prod_var.get(), self.ret_qty_var.get()
+        if not sel or qty <= 0: return
+        _, name, price, cat = self.data_manager.get_product_details_by_str(sel)
+
+        found = False
+        for i in self.returns_cart:
+            if (i['name'] == name or i.get('base_product') == name) and i['price'] == price:
+                i['qty'] += qty
+                i['subtotal'] = i['price'] * i['qty']
+                found = True
+                break
+        if not found:
+            self.returns_cart.append({
+                "code": "", "name": name, "price": price, "qty": qty, 
+                "subtotal": price * qty, "category": cat,
+                "orig_price": price # Store orig_price for promo logic
+            })
+        self.refresh_returns()
+
+    def refresh_returns(self):
+        for i in self.ret_tree.get_children(): self.ret_tree.delete(i)
+        tot = 0
+        for idx, i in enumerate(self.returns_cart):
+            # Show a clearer indicator that this cell is clickable for adjustments
+            # Clearer indicator for clickable cell
+            p_tag = " [ \u25BC ] " 
+            tag = ('idx_' + str(idx),)
+            if i.get('is_variant'): tag += ('variant',)
+            
+            self.ret_tree.insert("", "end", values=(
+                i['category'], i['name'], f"{i['price']:.2f}", i['qty'], f"{i['subtotal']:.2f}", p_tag
+            ), tags=tag)
+            tot += i['subtotal']
+        self.lbl_ret_total.config(text=f"Total Refund: {tot:.2f}")
+
+    def on_ret_tree_click(self, event):
+        region = self.ret_tree.identify_region(event.x, event.y)
+        if region == "cell":
+            column = self.ret_tree.identify_column(event.x)
+            if column == "#6": # Promo Column
+                item_id = self.ret_tree.identify_row(event.y)
+                if item_id:
+                    self.show_ret_promo_options(item_id)
+
+    def show_ret_promo_options(self, item_id):
+        tags = self.ret_tree.item(item_id, 'tags')
+        if not tags: return
+        cart_idx = -1
+        for t in tags:
+            if t.startswith('idx_'):
+                cart_idx = int(t.split('_')[1])
+                break
+        
+        if cart_idx == -1 or cart_idx >= len(self.returns_cart): return
+        
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label=f"Manual Price", command=lambda: self.ask_ret_manual_price(cart_idx))
+        menu.add_command(label=f"X% Discount", command=lambda: self.ask_ret_discount_promo(cart_idx))
+        menu.add_command(label=f"Buy Y Take Z", command=lambda: self.ask_ret_bytz_promo(cart_idx))
+        menu.add_separator()
+        menu.add_command(label="Remove Adj/Promo", command=lambda: self.remove_ret_promo(cart_idx))
+        menu.post(self.root.winfo_pointerx(), self.root.winfo_pointery())
+
+    def ask_ret_manual_price(self, idx):
+        item = self.returns_cart[idx]
+        orig_name = item.get('base_product', item['name'])
+        orig_price = item.get('orig_price', item['price'])
+        
+        new_price = simpledialog.askfloat("Manual Price", f"Enter Manual Refund Price for {orig_name}:", 
+                                          initialvalue=item['price'], minvalue=0.0, parent=self.root)
+        if new_price is None: return
+        
+        new_name = f"(Price Adj){orig_name}"
+        
+        item.update({
+            'name': new_name, 'price': new_price, 'subtotal': new_price * item['qty'],
+            'is_variant': True, 'base_product': orig_name, 'orig_price': orig_price
+        })
+        self.refresh_returns()
+
+    def ask_ret_discount_promo(self, idx):
+        item = self.returns_cart[idx]
+        percent = simpledialog.askinteger("Return Discount", "Enter Discount Percentage (1-99):", minvalue=1, maxvalue=99, parent=self.root)
+        if percent is None: return
+        
+        orig_name = item.get('base_product', item['name'])
+        orig_price = item.get('orig_price', item['price'])
+        
+        new_price = orig_price * (1 - (percent / 100.0))
+        new_name = f"({percent}%OFF){orig_name}"
+        
+        item.update({
+            'name': new_name, 'price': new_price, 'subtotal': new_price * item['qty'],
+            'is_variant': True, 'base_product': orig_name, 'orig_price': orig_price
+        })
+        self.refresh_returns()
+
+    def ask_ret_bytz_promo(self, idx):
+        item = self.returns_cart[idx]
+        base_name = item.get('base_product', item['name'])
+        y = simpledialog.askinteger("Buy Y", "Enter 'Y' (Buy Y):", minvalue=1, parent=self.root)
+        if y is None: return
+        z = simpledialog.askinteger("Take Z", "Enter 'Z' (Take Z):", minvalue=1, parent=self.root)
+        if z is None: return
+        
+        # BYTZ logic for returns
+        total_qty = 0
+        cat, orig_price = "General", 0.0
+        new_cart = []
+        for it in self.returns_cart:
+            if it.get('base_product', it['name']) == base_name:
+                total_qty += it['qty']
+                cat, orig_price = it['category'], it.get('orig_price', it['price'])
+            else:
+                new_cart.append(it)
+        
+        set_size = y + z
+        num_sets, remainder = total_qty // set_size, total_qty % set_size
+        free_qty, paid_qty = num_sets * z, (num_sets * y) + remainder
+        
+        if paid_qty > 0:
+            new_cart.append({
+                "code": "", "name": base_name, "price": orig_price, "qty": paid_qty, 
+                "subtotal": orig_price * paid_qty, "category": cat, "base_product": base_name, "orig_price": orig_price
+            })
+        if free_qty > 0:
+            new_cart.append({
+                "code": "", "name": f"(B{y}T{z}){base_name}", "price": 0.0, "qty": free_qty, 
+                "subtotal": 0.0, "category": cat, "is_variant": True, "base_product": base_name, "orig_price": orig_price
+            })
+        self.returns_cart = new_cart
+        self.refresh_returns()
+
+    def remove_ret_promo(self, idx):
+        item = self.returns_cart[idx]
+        base_name = item.get('base_product', item['name'])
+        orig_price, cat = item.get('orig_price', item['price']), item['category']
+        total_qty = sum(it['qty'] for it in self.returns_cart if it.get('base_product', it['name']) == base_name)
+        
+        new_cart = [it for it in self.returns_cart if it.get('base_product', it['name']) != base_name]
+        new_cart.append({
+            "code": "", "name": base_name, "price": orig_price, "qty": total_qty, 
+            "subtotal": orig_price * total_qty, "category": cat, "base_product": base_name, "orig_price": orig_price
+        })
+        self.returns_cart = new_cart
+        self.refresh_returns()
+
+    def del_returns_line(self):
+        if not self.ret_tree.selection(): return
+        item_id = self.ret_tree.selection()[0]
+        idx = self.ret_tree.index(item_id)
+        self.returns_cart.pop(idx)
+        self.refresh_returns()
+
+    def clear_returns(self):
+        self.returns_cart = []
+        self.refresh_returns()
+
+    def commit_returns(self):
+        if not self.returns_cart: return
+        tot = sum([i['subtotal'] for i in self.returns_cart])
+        if not messagebox.askyesno("Confirm Return", f"Process return for {tot:.2f}?\nItems will be added back to inventory."):
+            return
+
+        now = get_current_time()
+        date_str = now.strftime('%Y-%m-%d %H:%M:%S')
+        fname = f"Return_{now.strftime('%Y%m%d-%H%M%S')}.pdf"
+
+        # Generate Return Receipt (similar to sales but labeled RETURN)
+        success = self.report_manager.generate_thermal_sales_receipt(
+            os.path.join(CORRECTION_FOLDER, fname),
+            "RETURN RECEIPT", date_str, self.returns_cart,
+            tot, 0.0, user=self.session_user # Cash returned = tot
+        )
+
+        if success:
+            self.data_manager.add_transaction("returns", fname, self.returns_cart, date_str, user=self.session_user)
+            self.clear_returns()
+            messagebox.showinfo("Success", f"Return Processed. Receipt: {fname}")
+
+    # --- DAMAGED TAB ---
+    def setup_damaged_tab(self):
+        self.tab_damaged.config(style="Inventory.TFrame")
+        self.setup_lws_sidebar(self.tab_damaged, "damaged")
+
+        main_content = ttk.Frame(self.tab_damaged, style="Inventory.TFrame")
+        main_content.pack(side="left", fill="both", expand=True)
+
+        f = ttk.LabelFrame(main_content, text="Mark Damaged Items", style="Inventory.TLabelframe")
+        f.pack(fill="x", padx=5, pady=5)
+
+        top_bar = ttk.Frame(f, style="Inventory.TFrame")
+        top_bar.pack(fill="x", padx=5, pady=5)
+
+        self.dmg_prod_var = tk.StringVar()
+        self.dmg_dropdown = ttk.Combobox(top_bar, textvariable=self.dmg_prod_var, width=45)
+        self.dmg_dropdown['values'] = self.get_dropdown_values()
+        self.setup_searchable_combobox(self.dmg_dropdown)
+        self.dmg_dropdown.pack(side="left", padx=5)
+
+        ttk.Label(top_bar, text="Qty:", style="Inventory.TLabel").pack(side="left")
+        self.dmg_qty_var = tk.IntVar(value=1)
+        ttk.Entry(top_bar, textvariable=self.dmg_qty_var, width=5).pack(side="left", padx=5)
+        ttk.Button(top_bar, text="Add", command=self.add_damaged).pack(side="left", padx=10)
+
+        self.lbl_dmg_stock = ttk.Label(top_bar, text="", foreground="red", font=("Segoe UI", 9, "bold"), style="Inventory.TLabel")
+        self.lbl_dmg_stock.pack(side="left", padx=10)
+
+        self.dmg_dropdown.bind("<<ComboboxSelected>>", self.on_dmg_sel)
+
+        tree_frame = ttk.Frame(main_content, style="Inventory.TFrame")
+        tree_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        scrollbar = ttk.Scrollbar(tree_frame)
+        scrollbar.pack(side="right", fill="y")
+
+        self.dmg_tree = ttk.Treeview(tree_frame, columns=("cat", "name", "qty"), show="headings",
+                                     yscrollcommand=scrollbar.set)
+        scrollbar.config(command=self.dmg_tree.yview)
+        self.dmg_tree.heading("cat", text="Category")
+        self.dmg_tree.heading("name", text="Product")
+        self.dmg_tree.heading("qty", text="Qty")
+        self.dmg_tree.pack(fill="both", expand=True)
+
+        b = ttk.Frame(main_content, style="Inventory.TFrame")
+        b.pack(fill="x", padx=5, pady=10)
+        ttk.Button(b, text="CONFIRM DAMAGES", command=self.commit_damaged, style="Accent.TButton").pack(side="right", ipadx=10)
+        ttk.Button(b, text="Clear", command=self.clear_damaged).pack(side="right", padx=5)
+        ttk.Button(b, text="Del Line", command=self.del_damaged_line).pack(side="right", padx=5)
+
+    def on_dmg_sel(self, e=None):
+        sel = self.dmg_prod_var.get()
+        if not sel: self.lbl_dmg_stock.config(text=""); return
+
+        _, name, _, _ = self.data_manager.get_product_details_by_str(sel)
+        real_inv = self.data_manager.get_stock_level(name)
+        
+        # Subtract items already in damaged_cart
+        in_cart = sum(i['qty'] for i in self.damaged_cart if i['name'] == name)
+        
+        self.lbl_dmg_stock.config(text=f"Stock: {int(real_inv - in_cart)}")
+
+    def add_damaged(self):
+        sel, qty = self.dmg_prod_var.get(), self.dmg_qty_var.get()
+        if not sel or qty <= 0: return
+        _, name, price, cat = self.data_manager.get_product_details_by_str(sel)
+
+        real_inv = self.data_manager.get_stock_level(name)
+        in_cart = sum(i['qty'] for i in self.damaged_cart if i['name'] == name)
+        
+        if qty > (real_inv - in_cart):
+            messagebox.showwarning("Insufficient Stock", f"Cannot declare more than available stock ({int(real_inv - in_cart)}).")
+            return
+
+        found = False
+        for i in self.damaged_cart:
+            if i['name'] == name:
+                i['qty'] += qty
+                found = True
+                break
+        if not found:
+            self.damaged_cart.append({"code": "", "name": name, "price": price, "qty": qty, "category": cat})
+        self.refresh_damaged()
+        self.on_dmg_sel() # Update stock label
+
+    def refresh_damaged(self):
+        for i in self.dmg_tree.get_children(): self.dmg_tree.delete(i)
+        for i in self.damaged_cart:
+            self.dmg_tree.insert("", "end", values=(i['category'], i['name'], i['qty']))
+
+    def del_damaged_line(self):
+        if not self.dmg_tree.selection(): return
+        item_id = self.dmg_tree.selection()[0]
+        idx = self.dmg_tree.index(item_id)
+        self.damaged_cart.pop(idx)
+        self.refresh_damaged()
+
+    def clear_damaged(self):
+        self.damaged_cart = []
+        self.refresh_damaged()
+
+    def commit_damaged(self):
+        if not self.damaged_cart: return
+        if not messagebox.askyesno("Confirm Damages", "Remove these items from inventory as DAMAGED?"):
+            return
+
+        now = get_current_time()
+        date_str = now.strftime('%Y-%m-%d %H:%M:%S')
+        fname = f"Damaged_{now.strftime('%Y%m%d-%H%M%S')}.pdf"
+
+        # Calculate new stocks for receipt
+        p_items = []
+        for i in self.damaged_cart:
+            curr_stock = self.data_manager.get_stock_level(i['name'])
+            new_stock = curr_stock - i['qty']
+            x = i.copy()
+            x['new_stock'] = new_stock
+            p_items.append(x)
+
+        # Generate Damaged Receipt (similar to inventory but labeled DAMAGED)
+        success = self.report_manager.generate_thermal_inventory_receipt(
+            os.path.join(CORRECTION_FOLDER, fname),
+            "DAMAGED ITEMS", date_str, p_items, user=self.session_user
+        )
+
+        if success:
+            self.data_manager.add_transaction("damaged", fname, self.damaged_cart, date_str, user=self.session_user)
+            self.clear_damaged()
+            messagebox.showinfo("Success", f"Damages Recorded. Receipt: {fname}")
+
     # --- CORRECTION TAB ---
     def setup_correction_tab(self):
         paned = ttk.PanedWindow(self.tab_correction, orient="horizontal")
@@ -3582,7 +4128,7 @@ class POSSystem:
         tree_frame.pack(fill="both", expand=True, padx=5, pady=5)
         scrollbar = ttk.Scrollbar(tree_frame)
         scrollbar.pack(side="right", fill="y")
-        self.sum_tree = ttk.Treeview(tree_frame, columns=("cat", "name", "price", "in", "out", "rem", "sale"),
+        self.sum_tree = ttk.Treeview(tree_frame, columns=("cat", "name", "price", "in", "out", "ret", "dmg", "rem", "sale"),
                                      show="headings", yscrollcommand=scrollbar.set)
         scrollbar.config(command=self.sum_tree.yview)
 
@@ -3591,13 +4137,15 @@ class POSSystem:
         self.sum_tree.heading("price", text="Price")
         self.sum_tree.heading("in", text="In")
         self.sum_tree.heading("out", text="Out")
+        self.sum_tree.heading("ret", text="Returns")
+        self.sum_tree.heading("dmg", text="Damage")
         self.sum_tree.heading("rem", text="Stk")
         self.sum_tree.heading("sale", text="Sales")
         
         self.sum_tree.column("cat", width=60)
-        self.sum_tree.column("name", width=200)
+        self.sum_tree.column("name", width=180)
         self.sum_tree.column("price", width=50)
-        for col in ["in", "out", "rem"]: self.sum_tree.column(col, width=40)
+        for col in ["in", "out", "ret", "dmg", "rem"]: self.sum_tree.column(col, width=40)
         self.sum_tree.column("sale", width=60)
         
         self.sum_tree.pack(fill="both", expand=True)
@@ -3687,7 +4235,10 @@ class POSSystem:
             rem_stock = g_data['in'] - g_data['out']
 
             _, _, curr_price, config_cat = self.data_manager.get_product_details_by_str(f"{name}")
-            p_data = period_stats.get(name, {'in': 0, 'out': 0, 'sales_lines': [], 'in_lines': []})
+            p_data = period_stats.get(name, {
+                'in': 0, 'out': 0, 'returns': 0, 'damaged': 0,
+                'sales_lines': [], 'in_lines': [], 'return_lines': [], 'damaged_lines': []
+            })
 
             prices_map = {}
             # Aggregate by variant name and price point AND category
@@ -3695,7 +4246,7 @@ class POSSystem:
                 line_name = line.get('name', name)
                 line_cat = line.get('category', config_cat)
                 key = (line_name, line['price'], line_cat)
-                if key not in prices_map: prices_map[key] = {'in': 0, 'out': 0, 'sales': 0}
+                if key not in prices_map: prices_map[key] = {'in': 0, 'out': 0, 'returns': 0, 'damaged': 0, 'sales': 0, 'returns_amt': 0}
                 prices_map[key]['out'] += line['qty']
                 prices_map[key]['sales'] += line.get('amt', 0.0)
 
@@ -3703,14 +4254,32 @@ class POSSystem:
                 line_name = line.get('name', name)
                 line_cat = line.get('category', config_cat)
                 key = (line_name, line['price'], line_cat)
-                if key not in prices_map: prices_map[key] = {'in': 0, 'out': 0, 'sales': 0}
+                if key not in prices_map: prices_map[key] = {'in': 0, 'out': 0, 'returns': 0, 'damaged': 0, 'sales': 0, 'returns_amt': 0}
                 prices_map[key]['in'] += line['qty']
+
+            for line in p_data.get('return_lines', []):
+                line_name = line.get('name', name)
+                line_cat = line.get('category', config_cat)
+                key = (line_name, line['price'], line_cat)
+                if key not in prices_map: prices_map[key] = {'in': 0, 'out': 0, 'returns': 0, 'damaged': 0, 'sales': 0, 'returns_amt': 0}
+                prices_map[key]['returns'] += line['qty']
+                ret_a = line.get('amt', price * line['qty'])
+                prices_map[key]['returns_amt'] += ret_a
+                prices_map[key]['sales'] -= ret_a # Returns decrease sales
+
+            for line in p_data.get('damaged_lines', []):
+                line_name = line.get('name', name)
+                line_cat = line.get('category', config_cat)
+                key = (line_name, line['price'], line_cat)
+                if key not in prices_map: prices_map[key] = {'in': 0, 'out': 0, 'returns': 0, 'damaged': 0, 'sales': 0, 'returns_amt': 0}
+                prices_map[key]['damaged'] += line['qty']
+
 
             if not prices_map: 
                 final_cat = config_cat
                 if config_cat == "Phased Out" and name in global_stats:
                     final_cat = global_stats[name].get('latest_cat', "Phased Out")
-                prices_map[(name, curr_price, final_cat)] = {'in': 0, 'out': 0, 'sales': 0}
+                prices_map[(name, curr_price, final_cat)] = {'in': 0, 'out': 0, 'returns': 0, 'damaged': 0, 'sales': 0, 'returns_amt': 0}
 
             for (variant_name, price, variant_cat), data in prices_map.items():
                 is_variant = variant_name != name
@@ -3723,8 +4292,8 @@ class POSSystem:
                 is_phased_out_now = (name not in names_in_excel)
 
                 if not is_all_time:
-                    if data['in'] == 0 and data['out'] == 0: continue
-                elif data['in'] == 0 and data['out'] == 0 and show_rem == 0 and is_phased_out_now:
+                    if data['in'] == 0 and data['out'] == 0 and data['returns'] == 0 and data['damaged'] == 0: continue
+                elif data['in'] == 0 and data['out'] == 0 and data['returns'] == 0 and data['damaged'] == 0 and show_rem == 0 and is_phased_out_now:
                     continue
 
                 display_name = variant_name
@@ -3735,9 +4304,14 @@ class POSSystem:
                 if is_variant:
                     display_name = "  " + display_name
 
+                orig_p, _, _, _ = self.data_manager.get_product_details_by_str(variant_name)
+                
                 rows.append({
                     'code': "", 'category': variant_cat, 'name': display_name, 'price': price,
-                    'in': data['in'], 'out': data['out'], 'remaining': show_rem, 'sales': data['sales'],
+                    'orig_price': orig_p if orig_p is not None else price,
+                    'in': data['in'], 'out': data['out'], 'returns': data['returns'], 
+                    'returns_amt': data['returns_amt'], 'damaged': data['damaged'],
+                    'remaining': show_rem, 'sales': data['sales'],
                     'base_name': name, 'is_variant': is_variant
                 })
 
@@ -3750,20 +4324,27 @@ class POSSystem:
 
         rows = sorted(rows, key=sort_rows)
         for r in rows:
-            is_active = (r['in'] > 0 or r['out'] > 0 or r['remaining'] > 0 or r['base_name'] in names_in_excel)
+            is_active = (r['in'] > 0 or r['out'] > 0 or r['returns'] > 0 or r['damaged'] > 0 or r['remaining'] > 0 or r['base_name'] in names_in_excel)
             if is_active: final_rows.append(r)
 
         return final_rows, in_c, out_c, corr_list, master_renames
 
-    def gen_view(self, override_period=None):
+    def get_sum_data_rich(self, override_period=None):
+        """Returns 11 values: data, tot, p_txt, in_c, out_c, corr_list, is_daily, total_cash, total_change, per_trans, m_renames"""
         data, in_c, out_c, corr_list, m_renames = self.get_sum_data(override_period)
-        for i in self.sum_tree.get_children(): self.sum_tree.delete(i)
-
-        p_txt = self.report_type.get()
-        is_daily = (p_txt == "Daily") and (override_period is None)
         
-        if p_txt != "All Time":
-            period = override_period if override_period else self.get_period_dates()
+        p_txt = self.report_type.get()
+        period = override_period if override_period else self.get_period_dates()
+        
+        # Determine if this should be treated as a daily-style report (with transaction details, cash, etc.)
+        # True if user selected Daily in UI, OR if an override period for exactly 1 day is provided.
+        is_daily = (p_txt == "Daily" and override_period is None)
+        if override_period:
+            s, e = override_period
+            if (e - s).days < 1.5: # Roughly one day or less
+                is_daily = True
+        
+        if p_txt != "All Time" and not override_period:
             if period:
                 s, e = period
                 if s.date() == e.date():
@@ -3781,10 +4362,9 @@ class POSSystem:
         if is_daily and period:
             start_dt, end_dt = period
             sales_cash = {}
-            # Scan ledger to calculate exact cash and get items-per-trans
             for trans in self.data_manager.ledger:
                 try:
-                    ts = datetime.datetime.strptime(trans.get('timestamp', ''), "%Y-%m-%d %H:%M:%S")
+                    ts = datetime.datetime.strptime(str(trans.get('timestamp', '')), "%Y-%m-%d %H:%M:%S")
                     if start_dt <= ts <= end_dt:
                         t_type = trans.get('type')
                         fname = trans.get('filename')
@@ -3794,87 +4374,83 @@ class POSSystem:
                             change_amt = float(trans.get('change', 0.0))
                             total_disc = float(trans.get('total_discount', 0.0))
                             sales_cash[fname] = {'cash': cash_tnd, 'change': change_amt, 'total_discount': total_disc}
-                            
                             time_str = ts.strftime("%I:%M %p")
                             items = []
                             trans_subtot = 0.0
-                            
                             for item in trans.get('items', []):
                                 name = item.get('name', '')
-                                if name in self.data_manager.display_name_map:
-                                    name = self.data_manager.display_name_map[name]
+                                if name in self.data_manager.display_name_map: name = self.data_manager.display_name_map[name]
                                 price = float(item.get('price', 0.0))
                                 qty = int(item.get('qty', 0))
                                 subtotal = float(item.get('subtotal', price * qty))
                                 trans_subtot += subtotal
-                                
                                 is_variant = item.get('is_variant') or name.startswith('(')
-                                
-                                items.append({
-                                    'name': name,
-                                    'price': price,
-                                    'qty': qty,
-                                    'subtotal': subtotal,
-                                    'is_variant': is_variant
-                                })
-                            
-                            per_trans.append({
-                                'type': 'sales',
-                                'time': time_str,
-                                'filename': fname,
-                                'subtotal': trans_subtot,
-                                'cash': cash_tnd,
-                                'change': change_amt,
-                                'total_discount': total_disc,
-                                'items': items
-                            })
-                            
+                                items.append({'name': name, 'price': price, 'qty': qty, 'subtotal': subtotal, 'is_variant': is_variant})
+                            per_trans.append({'type': 'sales', 'time': time_str, 'filename': fname, 'subtotal': trans_subtot, 'cash': cash_tnd, 'change': change_amt, 'total_discount': total_disc, 'items': items})
                         elif t_type == 'inventory':
                             time_str = ts.strftime("%I:%M %p")
                             items = []
                             trans_qty = 0
-                            
                             for item in trans.get('items', []):
                                 name = item.get('name', '')
-                                if name in self.data_manager.display_name_map:
-                                    name = self.data_manager.display_name_map[name]
+                                if name in self.data_manager.display_name_map: name = self.data_manager.display_name_map[name]
                                 qty = int(item.get('qty', 0))
                                 trans_qty += qty
-                                
-                                items.append({
-                                    'name': name,
-                                    'qty': qty
-                                })
-                                
-                            per_trans.append({
-                                'type': 'inventory',
-                                'time': time_str,
-                                'filename': fname,
-                                'total_qty': trans_qty,
-                                'items': items
-                            })
-                            
+                                items.append({'name': name, 'qty': qty})
+                            per_trans.append({'type': 'inventory', 'time': time_str, 'filename': fname, 'total_qty': trans_qty, 'items': items})
+                        elif t_type == 'returns':
+                            time_str = ts.strftime("%I:%M %p")
+                            items = []
+                            trans_subtot = 0.0
+                            for item in trans.get('items', []):
+                                name = item.get('name', '')
+                                if name in self.data_manager.display_name_map: name = self.data_manager.display_name_map[name]
+                                price = float(item.get('price', 0.0))
+                                qty = int(item.get('qty', 0))
+                                subtotal = float(item.get('subtotal', price * qty))
+                                trans_subtot += subtotal
+                                items.append({'name': name, 'price': price, 'qty': qty, 'subtotal': subtotal})
+                            per_trans.append({'type': 'returns', 'time': time_str, 'filename': fname, 'subtotal': trans_subtot, 'items': items})
+                        elif t_type == 'damaged':
+                            time_str = ts.strftime("%I:%M %p")
+                            items = []
+                            trans_qty = 0
+                            for item in trans.get('items', []):
+                                name = item.get('name', '')
+                                if name in self.data_manager.display_name_map: name = self.data_manager.display_name_map[name]
+                                qty = int(item.get('qty', 0))
+                                trans_qty += qty
+                                items.append({'name': name, 'qty': qty})
+                            per_trans.append({'type': 'damaged', 'time': time_str, 'filename': fname, 'total_qty': trans_qty, 'items': items})
                         elif t_type == 'correction' and trans.get('ref_type') == 'sales':
                             ref = trans.get('ref_filename')
                             if ref in sales_cash:
                                 if 'cash_tendered' in trans and 'change' in trans:
                                     sales_cash[ref]['cash'] = float(trans.get('cash_tendered', 0.0))
                                     sales_cash[ref]['change'] = float(trans.get('change', 0.0))
-                                    if 'total_discount' in trans:
-                                        sales_cash[ref]['total_discount'] = float(trans.get('total_discount', 0.0))
-                                    # Also update the per_trans entry
+                                    if 'total_discount' in trans: sales_cash[ref]['total_discount'] = float(trans.get('total_discount', 0.0))
                                     for pt in per_trans:
                                         if pt.get('filename') == ref:
                                             pt['cash'] = sales_cash[ref]['cash']
                                             pt['change'] = sales_cash[ref]['change']
-                                            if 'total_discount' in sales_cash[ref]:
-                                                pt['total_discount'] = sales_cash[ref]['total_discount']
+                                            if 'total_discount' in sales_cash[ref]: pt['total_discount'] = sales_cash[ref]['total_discount']
                                             break
-                except ValueError:
-                    pass
-
+                except Exception: pass
             total_cash = sum(x['cash'] for x in sales_cash.values())
             total_change = sum(x['change'] for x in sales_cash.values())
+            tot = sum(p.get('subtotal', 0) for p in per_trans if p.get('type') == 'sales')
+            tot -= sum(p.get('subtotal', 0) for p in per_trans if p.get('type') == 'returns')
+        else:
+            tot = sum(s['sales'] for s in data)
+
+        return data, tot, p_txt, in_c, out_c, corr_list, is_daily, total_cash, total_change, per_trans, m_renames
+
+    def gen_view(self, override_period=None):
+        data, tot, p_txt, in_c, out_c, corr_list, is_daily, total_cash, total_change, per_trans, m_renames = self.get_sum_data_rich(override_period)
+        for i in self.sum_tree.get_children(): self.sum_tree.delete(i)
+
+        # The metadata calculation is now handled by get_sum_data_rich
+        pass
 
         if self.chk_items_per_trans_var.get() and is_daily:
             self.sum_tree.heading("cat", text="Time")
@@ -3882,61 +4458,77 @@ class POSSystem:
             self.sum_tree.heading("price", text="Price")
             self.sum_tree.heading("in", text="-")
             self.sum_tree.heading("out", text="Qty")
+            self.sum_tree.heading("ret", text="-")
+            self.sum_tree.heading("dmg", text="-")
             self.sum_tree.heading("rem", text="-")
             self.sum_tree.heading("sale", text="Subtot")
+
             
             for pt in per_trans:
                 if pt['type'] == 'sales':
-                    # Parent Node for Sales Receipt
                     header_text = f"SALES - {pt['filename']}"
                     parent_id = self.sum_tree.insert("", "end",
-                                         values=(pt['time'], header_text, "", "", "", "", f"{pt['subtotal']:.2f}"),
+                                         values=(pt['time'], header_text, "", "", "", "", "", "", f"{pt['subtotal']:.2f}"),
                                          tags=('parent',))
-                    
-                    # Child Nodes for Items
                     for item in pt['items']:
                         indent = "    " if item.get('is_variant') else "  "
                         self.sum_tree.insert(parent_id, "end",
-                                             values=("", f"{indent}{item['name']}", f"{item['price']:.2f}", "", str(item['qty']), "", f"{item['subtotal']:.2f}"))
-                    
-                    # Show Transaction Discount
+                                             values=("", f"{indent}{item['name']}", f"{item['price']:.2f}", "", str(item['qty']), "", "", "", f"{item['subtotal']:.2f}"))
                     if pt.get('total_discount', 0) > 0:
                         self.sum_tree.insert(parent_id, "end",
-                                             values=("", "  TOTAL DISCOUNT", "", "", "", "", f"{pt['total_discount']:.2f}"), tags=('info',))
-                                             
-                    # Show Transaction Subtotal
+                                             values=("", "  TOTAL DISCOUNT", "", "", "", "", "", "", f"{pt['total_discount']:.2f}"), tags=('info',))
                     self.sum_tree.insert(parent_id, "end",
-                                         values=("", "  TOTAL DUE", "", "", "", "", f"{pt['subtotal']:.2f}"), tags=('info',))
-
-                    # Child Nodes for Cash/Change
+                                         values=("", "  TOTAL DUE", "", "", "", "", "", "", f"{pt['subtotal']:.2f}"), tags=('info',))
                     if pt['cash'] > 0 or pt['change'] > 0:
                         self.sum_tree.insert(parent_id, "end",
-                                             values=("", "  CASH TENDERED", "", "", "", "", f"{pt['cash']:.2f}"), tags=('info',))
+                                             values=("", "  CASH TENDERED", "", "", "", "", "", "", f"{pt['cash']:.2f}"), tags=('info',))
                         self.sum_tree.insert(parent_id, "end",
-                                             values=("", "  CHANGE", "", "", "", "", f"{pt['change']:.2f}"), tags=('info',))
-                    
+                                             values=("", "  CHANGE", "", "", "", "", "", "", f"{pt['change']:.2f}"), tags=('info',))
                     tot += pt['subtotal']
+
                 
                 elif pt['type'] == 'inventory':
-                    # Parent Node for Inventory Receipt
                     header_text = f"INVENTORY - {pt['filename']}"
                     parent_id = self.sum_tree.insert("", "end",
-                                         values=(pt['time'], header_text, "", "", str(pt['total_qty']), "", ""),
+                                         values=(pt['time'], header_text, "", "", str(pt['total_qty']), "", "", "", ""),
                                          tags=('parent',))
-                    
-                    # Child Nodes for Items
                     for item in pt['items']:
                         self.sum_tree.insert(parent_id, "end",
-                                             values=("", f"  {item['name']}", "", "", str(item['qty']), "", ""))
+                                             values=("", f"  {item['name']}", "", "", str(item['qty']), "", "", "", ""))
+
+                
+                elif pt['type'] == 'returns':
+                    header_text = f"RETURN - {pt['filename']}"
+                    parent_id = self.sum_tree.insert("", "end",
+                                         values=(pt['time'], header_text, "", "", "", str(len(pt['items'])), "", "", f"-{pt['subtotal']:.2f}"),
+                                         tags=('parent',))
+                    for item in pt['items']:
+                        self.sum_tree.insert(parent_id, "end",
+                                             values=("", f"  {item['name']}", f"{item['price']:.2f}", "", "", str(item['qty']), "", "", f"-{item['subtotal']:.2f}"))
+                    tot -= pt['subtotal']
+
+
+                elif pt['type'] == 'damaged':
+                    header_text = f"DAMAGED - {pt['filename']}"
+                    parent_id = self.sum_tree.insert("", "end",
+                                         values=(pt['time'], header_text, "", "", "", "", str(pt['total_qty']), "", ""),
+                                         tags=('parent',))
+                    for item in pt['items']:
+                        self.sum_tree.insert(parent_id, "end",
+                                             values=("", f"  {item['name']}", "", "", "", "", str(item['qty']), "", ""))
+
+
         else:
             self.sum_tree.heading("cat", text="Cat")
             self.sum_tree.heading("name", text="Product")
             self.sum_tree.heading("price", text="Price")
             self.sum_tree.heading("in", text="In")
             self.sum_tree.heading("out", text="Out")
+            self.sum_tree.heading("ret", text="Returns")
+            self.sum_tree.heading("dmg", text="Damage")
             self.sum_tree.heading("rem", text="Stk")
             self.sum_tree.heading("sale", text="Sales")
-            
+
             def sort_key(x):
                 cat = x['category']
                 if cat == "Phased Out": cat = "zzz_Phased Out"
@@ -3949,21 +4541,22 @@ class POSSystem:
                     rem_val = ""
                 
                 self.sum_tree.insert("", "end",
-                                     values=(s['category'], s['name'], f"{s['price']:.2f}", int(s['in']), int(s['out']),
+                                     values=(s['category'], s['name'], f"{s['price']:.2f}", 
+                                             int(s['in']) if s['in'] != 0 else "", 
+                                             int(s['out']) if s['out'] != 0 else "",
+                                             int(s.get('returns', 0)) if s.get('returns', 0) != 0 else "",
+                                             int(s.get('damaged', 0)) if s.get('damaged', 0) != 0 else "",
                                              rem_val, f"{s['sales']:.2f}"))
                 tot += s['sales']
 
+
+
         self.lbl_sum_info.config(text=f"Period: {p_txt} | Sales: {tot:.2f} | Customers: {out_c}")
         
-        # Calculate total discount for the period
+        # Calculate total discount for the period from transaction records (reliable)
         total_discount_period = 0.0
-        for d_row in data:
-            if d_row.get('is_variant', False):
-                orig_price = d_row.get('orig_price', d_row.get('price', 0))
-                total_discount_period += (orig_price - d_row.get('price', 0)) * d_row.get('out', 0)
-        # Also sum from per_trans which is more reliable
         if per_trans:
-            total_discount_period = sum(pt.get('total_discount', 0.0) for pt in per_trans if pt.get('type') == 'sales')
+            total_discount_period = sum(float(pt.get('total_discount', 0.0)) for pt in per_trans if pt.get('type') == 'sales')
         
         if is_daily:
             self.lbl_sum_cash.config(text=f"Total Cash Tendered: {total_cash:,.2f}")
@@ -4016,105 +4609,8 @@ class POSSystem:
         start_of_day = today.replace(hour=0, minute=0, second=0, microsecond=0)
         end_of_day = today.replace(hour=23, minute=59, second=59, microsecond=999999)
         period = (start_of_day, end_of_day)
+        data, tot, p_txt, in_c, out_c, corr_list, is_daily, total_cash, total_change, per_trans, m_renames = self.get_sum_data_rich(override_period=period)
         
-        data, in_c, out_c, corr_list, m_renames = self.get_sum_data(override_period=period)
-        
-        tot = 0
-        total_cash = 0.0
-        total_change = 0.0
-        per_trans = []
-        
-        sales_cash = {}
-        for trans in self.data_manager.ledger:
-            try:
-                ts = datetime.datetime.strptime(trans.get('timestamp', ''), "%Y-%m-%d %H:%M:%S")
-                if start_of_day <= ts <= end_of_day:
-                    t_type = trans.get('type')
-                    fname = trans.get('filename')
-                    
-                    if t_type == 'sales':
-                        cash_tnd = float(trans.get('cash_tendered', 0.0))
-                        change_amt = float(trans.get('change', 0.0))
-                        total_disc = float(trans.get('total_discount', 0.0))
-                        sales_cash[fname] = {'cash': cash_tnd, 'change': change_amt, 'total_discount': total_disc}
-                        
-                        time_str = ts.strftime("%I:%M %p")
-                        items = []
-                        trans_subtot = 0.0
-                        
-                        for item in trans.get('items', []):
-                            name = item.get('name', '')
-                            if name in self.data_manager.display_name_map:
-                                name = self.data_manager.display_name_map[name]
-                            price = float(item.get('price', 0.0))
-                            qty = int(item.get('qty', 0))
-                            subtotal = float(item.get('subtotal', price * qty))
-                            trans_subtot += subtotal
-                            
-                            is_variant = item.get('is_variant') or name.startswith('(')
-                            
-                            items.append({
-                                'name': name,
-                                'price': price,
-                                'qty': qty,
-                                'subtotal': subtotal,
-                                'is_variant': is_variant
-                            })
-                        
-                        per_trans.append({
-                            'type': 'sales',
-                            'time': time_str,
-                            'filename': fname,
-                            'subtotal': trans_subtot,
-                            'cash': cash_tnd,
-                            'change': change_amt,
-                            'total_discount': total_disc,
-                            'items': items
-                        })
-                        tot += trans_subtot
-                        
-                    elif t_type == 'inventory':
-                        time_str = ts.strftime("%I:%M %p")
-                        items = []
-                        trans_qty = 0
-                        
-                        for item in trans.get('items', []):
-                            name = item.get('name', '')
-                            if name in self.data_manager.display_name_map:
-                                name = self.data_manager.display_name_map[name]
-                            qty = int(item.get('qty', 0))
-                            trans_qty += qty
-                            
-                            items.append({
-                                'name': name,
-                                'qty': qty
-                            })
-                            
-                        per_trans.append({
-                            'type': 'inventory',
-                            'time': time_str,
-                            'filename': fname,
-                            'total_qty': trans_qty,
-                            'items': items
-                        })
-                        
-                    elif t_type == 'correction' and trans.get('ref_type') == 'sales':
-                        ref = trans.get('ref_filename')
-                        if ref in sales_cash:
-                            if 'cash_tendered' in trans and 'change' in trans:
-                                sales_cash[ref]['cash'] = float(trans.get('cash_tendered', 0.0))
-                                sales_cash[ref]['change'] = float(trans.get('change', 0.0))
-                                for pt in per_trans:
-                                    if pt.get('filename') == ref:
-                                        pt['cash'] = sales_cash[ref]['cash']
-                                        pt['change'] = sales_cash[ref]['change']
-                                        break
-            except ValueError:
-                continue
-
-        total_cash = sum(x['cash'] for x in sales_cash.values())
-        total_change = sum(x['change'] for x in sales_cash.values())
-
         fname = f"Daily_Summary_{today.strftime('%Y%m%d')}.pdf"
         full_path = os.path.join(SUMMARY_FOLDER, fname)
         
@@ -4284,7 +4780,7 @@ class POSSystem:
         for trans in self.data_manager.ledger:
             try:
                 t_type = trans.get('type')
-                if t_type not in ('sales', 'correction'):
+                if t_type not in ('sales', 'correction', 'returns', 'damaged'):
                     continue
 
                 ts_str = trans.get('timestamp', '')
@@ -4302,9 +4798,12 @@ class POSSystem:
                     daily_data[date_key] = {
                         'total_sales': 0.0,
                         'total_discount': 0.0,
+                        'total_returns': 0.0,
+                        'total_damaged': 0,
                         'customers': 0,
                         'cat_sales': {}
                     }
+
 
                 day = daily_data[date_key]
 
@@ -4334,6 +4833,26 @@ class POSSystem:
                         day['cat_sales'][cat] = day['cat_sales'].get(cat, 0.0) + subtotal
                         day['total_sales'] += subtotal
 
+                elif t_type == 'returns':
+                    total_ret = 0.0
+                    for item in trans.get('items', []):
+                        paid_amt = float(item.get('subtotal', float(item.get('price', 0)) * int(item.get('qty', 0))))
+                        total_ret += paid_amt
+                        
+                        # Subtract from category too to keep category sum = total sales
+                        cat = item.get('category', 'Uncategorized')
+                        day['cat_sales'][cat] = day['cat_sales'].get(cat, 0.0) - paid_amt
+                        
+                    day['total_returns'] += total_ret
+                    day['total_sales'] -= total_ret
+
+                elif t_type == 'damaged':
+                    total_dmg = 0
+                    for item in trans.get('items', []):
+                        total_dmg += int(item.get('qty', 0))
+                    day['total_damaged'] += total_dmg
+
+
             except Exception:
                 continue
 
@@ -4357,8 +4876,9 @@ class POSSystem:
         self._sr_month_label = month_label
 
         # Build treeview columns dynamically
-        col_ids = ["date"] + [f"cat_{i}" for i in range(len(categories))] + ["total_sales", "total_discount", "customers"]
+        col_ids = ["date"] + [f"cat_{i}" for i in range(len(categories))] + ["total_sales", "total_returns", "total_damaged", "total_discount", "customers"]
         self.sr_tree["columns"] = col_ids
+
 
         # Configure columns
         self.sr_tree.heading("date", text="Date")
@@ -4369,14 +4889,21 @@ class POSSystem:
             self.sr_tree.heading(col_id, text=cat)
             self.sr_tree.column(col_id, width=100, anchor="e")
 
-        self.sr_tree.heading("total_sales", text="Daily Total Sales")
+        self.sr_tree.heading("total_sales", text="Net Sales")
         self.sr_tree.column("total_sales", width=120, anchor="e")
 
-        self.sr_tree.heading("total_discount", text="Daily Total Discount")
+        self.sr_tree.heading("total_returns", text="Returns")
+        self.sr_tree.column("total_returns", width=100, anchor="e")
+
+        self.sr_tree.heading("total_damaged", text="Damage")
+        self.sr_tree.column("total_damaged", width=80, anchor="center")
+
+        self.sr_tree.heading("total_discount", text="Discount")
         self.sr_tree.column("total_discount", width=130, anchor="e")
 
         self.sr_tree.heading("customers", text="Customers")
         self.sr_tree.column("customers", width=80, anchor="center")
+
 
         # Clear existing rows
         for item in self.sr_tree.get_children():
@@ -4391,9 +4918,12 @@ class POSSystem:
 
         # Monthly totals accumulators
         month_total_sales = 0.0
+        month_total_returns = 0.0
+        month_total_damaged = 0
         month_total_discount = 0.0
         month_total_customers = 0
         month_cat_totals = {cat: 0.0 for cat in categories}
+
 
         for date_str in sorted_dates:
             day = daily_data[date_str]
@@ -4413,14 +4943,19 @@ class POSSystem:
                 row_values.append(f"{cat_val:,.2f}" if cat_val > 0 else "-")
 
             row_values.append(f"{day['total_sales']:,.2f}")
+            row_values.append(f"{day['total_returns']:,.2f}" if day['total_returns'] > 0 else "-")
+            row_values.append(str(day['total_damaged']) if day['total_damaged'] > 0 else "-")
             row_values.append(f"{day['total_discount']:,.2f}" if day['total_discount'] > 0 else "-")
             row_values.append(str(day['customers']))
 
             month_total_sales += day['total_sales']
+            month_total_returns += day['total_returns']
+            month_total_damaged += day['total_damaged']
             month_total_discount += day['total_discount']
             month_total_customers += day['customers']
 
             self.sr_tree.insert("", "end", values=row_values, tags=('normal',))
+
 
         # Insert Monthly Totals row
         totals_row = ["MONTHLY TOTAL"]
@@ -4428,10 +4963,13 @@ class POSSystem:
             val = month_cat_totals[cat]
             totals_row.append(f"{val:,.2f}" if val > 0 else "-")
         totals_row.append(f"{month_total_sales:,.2f}")
+        totals_row.append(f"{month_total_returns:,.2f}" if month_total_returns > 0 else "-")
+        totals_row.append(str(month_total_damaged) if month_total_damaged > 0 else "-")
         totals_row.append(f"{month_total_discount:,.2f}" if month_total_discount > 0 else "-")
         totals_row.append(str(month_total_customers))
 
         self.sr_tree.insert("", "end", values=totals_row, tags=('total_row',))
+
 
         self.lbl_sr_info.config(
             text=f"{month_label} | Total Sales: {month_total_sales:,.2f} | "
@@ -4524,13 +5062,13 @@ class POSSystem:
 
         # --- Title Row ---
         title_text = f"Sales Report - {month_label} - {self.data_manager.business_name}"
-        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=4 + len(categories))
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=6 + len(categories))
         title_cell = ws.cell(row=1, column=1, value=title_text)
         title_cell.font = Font(name="Segoe UI", bold=True, size=14, color="1B5E20")
         title_cell.alignment = Alignment(horizontal="center")
 
         # --- Header Row ---
-        headers = ["Date"] + categories + ["Daily Total Sales", "Daily Total Discount", "Customers"]
+        headers = ["Date"] + categories + ["Net Sales", "Returns", "Damage", "Discount", "Customers"]
         header_row = 3
         for col_idx, header in enumerate(headers, 1):
             cell = ws.cell(row=header_row, column=col_idx, value=header)
@@ -4542,6 +5080,8 @@ class POSSystem:
         # --- Data Rows ---
         sorted_dates = sorted(daily_data.keys())
         month_total_sales = 0.0
+        month_total_returns = 0.0
+        month_total_damaged = 0
         month_total_discount = 0.0
         month_total_customers = 0
         month_cat_totals = {cat: 0.0 for cat in categories}
@@ -4564,7 +5104,7 @@ class POSSystem:
             for i, cat in enumerate(categories):
                 cat_val = day['cat_sales'].get(cat, 0.0)
                 month_cat_totals[cat] += cat_val
-                cell = ws.cell(row=row_num, column=2 + i, value=cat_val if cat_val > 0 else None)
+                cell = ws.cell(row=row_num, column=2 + i, value=cat_val if abs(cat_val) > 0.001 else None)
                 cell.font = data_font
                 cell.number_format = currency_fmt
                 cell.border = thin_border
@@ -4576,19 +5116,32 @@ class POSSystem:
             cell.border = thin_border
             cell.alignment = Alignment(horizontal="right")
 
-            disc_val = day['total_discount'] if day['total_discount'] > 0 else None
-            cell = ws.cell(row=row_num, column=3 + len(categories), value=disc_val)
+            cell = ws.cell(row=row_num, column=3 + len(categories), value=day['total_returns'] if day['total_returns'] > 0 else None)
             cell.font = data_font
             cell.number_format = currency_fmt
             cell.border = thin_border
             cell.alignment = Alignment(horizontal="right")
 
-            cell = ws.cell(row=row_num, column=4 + len(categories), value=day['customers'])
+            cell = ws.cell(row=row_num, column=4 + len(categories), value=day['total_damaged'] if day['total_damaged'] > 0 else None)
+            cell.font = data_font
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal="center")
+
+            disc_val = day['total_discount'] if day['total_discount'] > 0 else None
+            cell = ws.cell(row=row_num, column=5 + len(categories), value=disc_val)
+            cell.font = data_font
+            cell.number_format = currency_fmt
+            cell.border = thin_border
+            cell.alignment = Alignment(horizontal="right")
+
+            cell = ws.cell(row=row_num, column=6 + len(categories), value=day['customers'])
             cell.font = data_font
             cell.border = thin_border
             cell.alignment = Alignment(horizontal="center")
 
             month_total_sales += day['total_sales']
+            month_total_returns += day['total_returns']
+            month_total_damaged += day['total_damaged']
             month_total_discount += day['total_discount']
             month_total_customers += day['customers']
 
@@ -4602,7 +5155,7 @@ class POSSystem:
 
         for i, cat in enumerate(categories):
             val = month_cat_totals[cat]
-            cell = ws.cell(row=totals_row_num, column=2 + i, value=val if val > 0 else None)
+            cell = ws.cell(row=totals_row_num, column=2 + i, value=val if abs(val) > 0.001 else None)
             cell.font = total_font
             cell.fill = total_fill
             cell.number_format = currency_fmt
@@ -4616,7 +5169,20 @@ class POSSystem:
         cell.border = thin_border
         cell.alignment = Alignment(horizontal="right")
 
-        cell = ws.cell(row=totals_row_num, column=3 + len(categories),
+        cell = ws.cell(row=totals_row_num, column=3 + len(categories), value=month_total_returns if month_total_returns > 0 else None)
+        cell.font = total_font
+        cell.fill = total_fill
+        cell.number_format = currency_fmt
+        cell.border = thin_border
+        cell.alignment = Alignment(horizontal="right")
+
+        cell = ws.cell(row=totals_row_num, column=4 + len(categories), value=month_total_damaged if month_total_damaged > 0 else None)
+        cell.font = total_font
+        cell.fill = total_fill
+        cell.border = thin_border
+        cell.alignment = Alignment(horizontal="center")
+
+        cell = ws.cell(row=totals_row_num, column=5 + len(categories),
                        value=month_total_discount if month_total_discount > 0 else None)
         cell.font = total_font
         cell.fill = total_fill
@@ -4624,7 +5190,7 @@ class POSSystem:
         cell.border = thin_border
         cell.alignment = Alignment(horizontal="right")
 
-        cell = ws.cell(row=totals_row_num, column=4 + len(categories), value=month_total_customers)
+        cell = ws.cell(row=totals_row_num, column=6 + len(categories), value=month_total_customers)
         cell.font = total_font
         cell.fill = total_fill
         cell.border = thin_border
@@ -4634,9 +5200,11 @@ class POSSystem:
         ws.column_dimensions[get_column_letter(1)].width = 14
         for i in range(len(categories)):
             ws.column_dimensions[get_column_letter(2 + i)].width = 16
-        ws.column_dimensions[get_column_letter(2 + len(categories))].width = 18
-        ws.column_dimensions[get_column_letter(3 + len(categories))].width = 20
-        ws.column_dimensions[get_column_letter(4 + len(categories))].width = 12
+        ws.column_dimensions[get_column_letter(2 + len(categories))].width = 18 # Net Sales
+        ws.column_dimensions[get_column_letter(3 + len(categories))].width = 15 # Returns
+        ws.column_dimensions[get_column_letter(4 + len(categories))].width = 10 # Damage
+        ws.column_dimensions[get_column_letter(5 + len(categories))].width = 18 # Discount
+        ws.column_dimensions[get_column_letter(6 + len(categories))].width = 12 # Customers
 
         try:
             wb.save(full_path)
@@ -4644,6 +5212,7 @@ class POSSystem:
         except Exception as e:
             messagebox.showerror("Export Error", f"Failed to save XLSX: {e}")
             return False
+
 
     def _generate_sales_report_pdf(self, categories, daily_data, month_label, full_path):
         """Internal: generates the PDF file (A4 Landscape). Returns True on success."""
@@ -4669,12 +5238,15 @@ class POSSystem:
 
             # --- Calculate column widths ---
             num_cat = len(categories)
-            date_w = 1.1 * inch
-            total_sales_w = 1.1 * inch
-            total_disc_w = 1.1 * inch
-            customers_w = 0.8 * inch
-            fixed_w = date_w + total_sales_w + total_disc_w + customers_w
+            date_w = 1.0 * inch
+            total_sales_w = 0.9 * inch
+            returns_w = 0.7 * inch
+            damage_w = 0.6 * inch
+            total_disc_w = 0.9 * inch
+            customers_w = 0.7 * inch
+            fixed_w = date_w + total_sales_w + returns_w + damage_w + total_disc_w + customers_w
             remaining_w = usable_width - fixed_w
+
 
             if num_cat > 0:
                 cat_w = max(remaining_w / num_cat, 0.8 * inch)
@@ -4687,13 +5259,18 @@ class POSSystem:
             for i in range(num_cat):
                 col_positions.append(x)
                 x += cat_w
-            col_positions.append(x)  # Total Sales
+            col_positions.append(x)  # Net Sales
             x += total_sales_w
+            col_positions.append(x)  # Returns
+            x += returns_w
+            col_positions.append(x)  # Damage
+            x += damage_w
             col_positions.append(x)  # Total Discount
             x += total_disc_w
             col_positions.append(x)  # Customers
 
-            headers = ["Date"] + categories + ["Total Sales", "Total Discount", "Customers"]
+            headers = ["Date"] + categories + ["Net Sales", "Returns", "Damage", "Discount", "Customers"]
+
 
             def draw_page_header(y_pos):
                 c.setFont("Helvetica-Bold", 14)
@@ -4743,9 +5320,12 @@ class POSSystem:
             sorted_dates = sorted(daily_data.keys())
             data_rows = []
             month_total_sales = 0.0
+            month_total_returns = 0.0
+            month_total_damaged = 0
             month_total_discount = 0.0
             month_total_customers = 0
             month_cat_totals = {cat: 0.0 for cat in categories}
+
 
             for date_str in sorted_dates:
                 day = daily_data[date_str]
@@ -4759,12 +5339,17 @@ class POSSystem:
                 for cat in categories:
                     cat_val = day['cat_sales'].get(cat, 0.0)
                     month_cat_totals[cat] += cat_val
-                    row.append(f"{cat_val:,.2f}" if cat_val > 0 else "-")
+                    row.append(f"{cat_val:,.2f}" if abs(cat_val) > 0.001 else "-")
+                
                 row.append(f"{day['total_sales']:,.2f}")
+                row.append(f"{day['total_returns']:,.2f}" if day['total_returns'] > 0 else "-")
+                row.append(str(day['total_damaged']) if day['total_damaged'] > 0 else "-")
                 row.append(f"{day['total_discount']:,.2f}" if day['total_discount'] > 0 else "-")
                 row.append(str(day['customers']))
 
                 month_total_sales += day['total_sales']
+                month_total_returns += day['total_returns']
+                month_total_damaged += day['total_damaged']
                 month_total_discount += day['total_discount']
                 month_total_customers += day['customers']
                 data_rows.append(row)
@@ -4772,10 +5357,13 @@ class POSSystem:
             total_row = ["MONTHLY TOTAL"]
             for cat in categories:
                 val = month_cat_totals[cat]
-                total_row.append(f"{val:,.2f}" if val > 0 else "-")
+                total_row.append(f"{val:,.2f}" if abs(val) > 0.001 else "-")
             total_row.append(f"{month_total_sales:,.2f}")
+            total_row.append(f"{month_total_returns:,.2f}" if month_total_returns > 0 else "-")
+            total_row.append(str(month_total_damaged) if month_total_damaged > 0 else "-")
             total_row.append(f"{month_total_discount:,.2f}" if month_total_discount > 0 else "-")
             total_row.append(str(month_total_customers))
+
 
             # --- Render Pages ---
             y = top_margin
@@ -5464,13 +6052,95 @@ class POSSystem:
         if not confirm:
             return
 
+        # Check internet connection
+        if not self.is_online():
+            messagebox.showerror("No Internet", "An active internet connection is required to ensure a secure backup is emailed before data wipes.")
+            return
+
         confirm2 = simpledialog.askstring("Confirm Deletion", "Type 'DELETE' to confirm deletion of all data:")
         if confirm2 != "DELETE":
             messagebox.showinfo("Cancelled", "Data deletion cancelled.")
             return
 
         try:
-            # 1. Delete the AppData folder (contains config, ledger, backups)
+            # 4. Security Backup (Requirement 1 & 2)
+            now = get_current_time()
+            self.generate_daily_summary_on_close() # Ensure today's summary is generated
+            
+            # Increment and save count
+            self.data_manager.summary_count += 1
+            self.data_manager.save_ledger()
+            
+            summary_fname = f"Daily_Summary_{now.strftime('%Y%m%d')}.pdf"
+            summary_path = os.path.join(SUMMARY_FOLDER, summary_fname)
+            
+            import tempfile
+            import shutil
+            temp_dir = tempfile.mkdtemp()
+            temp_ledger = os.path.join(temp_dir, "ledger.json")
+            temp_summary = os.path.join(temp_dir, summary_fname)
+            
+            shutil.copy2(LEDGER_FILE, temp_ledger)
+            summary_exists = os.path.exists(summary_path)
+            if summary_exists:
+                shutil.copy2(summary_path, temp_summary)
+            
+            recipient = self.data_manager.config.get("recipient_email", "").strip()
+            
+            email_done = threading.Event()
+            email_error = [None]
+            
+            def on_success():
+                email_done.set()
+                
+            def on_error(msg):
+                email_error[0] = msg
+                email_done.set()
+
+            self.email_manager.trigger_summary_email(
+                recipient=recipient,
+                summary_pdf_path=temp_summary if summary_exists else "",
+                ledger_path=temp_ledger,
+                business_name=self.data_manager.business_name,
+                count=self.data_manager.summary_count,
+                user=self.session_user,
+                extra_body="--- SECURITY BACKUP BEFORE FACTORY RESET ---\nThis is an automated backup triggered by a 'DELETE ALL DATA' request.\n",
+                on_success=on_success,
+                on_error=on_error
+            )
+            
+            # Progress window
+            wait_win = tk.Toplevel(self.root)
+            wait_win.title("Security Backup")
+            wait_win.geometry("300x120")
+            wait_win.resizable(False, False)
+            if self.root.winfo_viewable():
+                wait_win.transient(self.root)
+            wait_win.grab_set()
+            
+            ttk.Label(wait_win, text="Sending secure backup email...\nPlease do not close the software.", font=('Helvetica', 10, 'bold'), padding=20, wraplength=250, justify="center").pack()
+            wait_win.update()
+            
+            start_wait = time.time()
+            while not email_done.is_set() and time.time() - start_wait < 60: # 60s timeout
+                self.root.update()
+                time.sleep(0.1)
+                
+            wait_win.destroy()
+            
+            if not email_done.is_set():
+                messagebox.showerror("Backup Failed", "Timed out waiting for backup email. Deletion aborted for security.")
+                return
+            
+            if email_error[0]:
+                messagebox.showerror("Backup Failed", f"Failed to send backup email: {email_error[0]}\n\nDeletion aborted for security.")
+                return
+
+            # Cleanup temp files
+            try: shutil.rmtree(temp_dir, ignore_errors=True)
+            except: pass
+
+            # 5. Data Deletion (Original Logic)
             if os.path.exists(APP_DATA_DIR):
                 shutil.rmtree(APP_DATA_DIR, ignore_errors=True)
 
@@ -5684,6 +6354,13 @@ class POSSystem:
         self.device_tree.pack(fill="both", expand=True, padx=5, pady=5)
 
         self.qr_lbl.config(text="Click 'Generate New QR' to start LWS")
+
+    def is_online(self):
+        try:
+            socket.create_connection(("8.8.8.8", 53), timeout=3)
+            return True
+        except OSError:
+            return False
 
     def get_local_ip(self):
         try:
